@@ -1040,6 +1040,145 @@ public class Qwen35: Module, VLMModel {
         return .logits(output)
     }
 
+    /// Warm, windowed continuation through an image-bearing remainder.
+    ///
+    /// Unlike `prepare` (single-shot, `windowSize` ignored — `O(L²)`
+    /// full-attention scratch that OOMs on long image prompts), this honors
+    /// `windowSize`: it runs the vision tower and the image→token merge **once**
+    /// over the remainder, computes the new image's M-RoPE positions **once**
+    /// from the seeded **Position Anchor** (so the image's diverging t/h/w
+    /// indices start at the anchor, not zero), then drives the language-model
+    /// forward in chunks of `windowSize`. The full-attention scratch is bounded
+    /// to `[heads, chunk, L]` instead of `[heads, L, L]`, so it cannot crash on
+    /// a long prefix or a large image.
+    ///
+    /// `cache` must already be warmed to the restore offset `P` (a fresh cache
+    /// means `P = 0`, a crash-safe cold prefill). `state` carries the anchor's
+    /// rope delta in the `qwen35.ropeDeltas` slot (zero / absent for an
+    /// image-free prefix). The returned state carries the rope delta the
+    /// post-image text tail resumes with (`getRopeIndex` delta − `P`), so a
+    /// caller threading state end-to-end continues that tail with the ordinary
+    /// flat-continuation branch. Decode stays caller-owned.
+    public func prepareContinuation(
+        _ input: LMInput,
+        cache: [any KVCache],
+        state: LMOutput.State?,
+        windowSize: Int
+    ) throws -> PrepareResult {
+        let inputIds = input.text.tokens
+        let remainderLength = inputIds.dim(-1)
+        precondition(remainderLength > 0, "prepareContinuation needs a non-empty remainder")
+
+        // The Position Anchor: token offset already in the cache (P) plus the
+        // rope delta the cached images accumulated, carried in `state`.
+        let faIdx = languageModel.model.faIdx
+        let cacheOffset = cache.indices.contains(faIdx) ? cache[faIdx].offset : 0
+        var anchorRopeDelta = 0
+        if let seeded = state?[ropeDeltasKey] {
+            anchorRopeDelta = seeded.asType(.int32).item(Int.self)
+        }
+        let positionOffset = cacheOffset + anchorRopeDelta
+
+        // Vision tower over the remainder's pixels (same path as `prepare`).
+        var pixelValues: MLXArray?
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+        if let video = input.video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            videoFrames = video.frames
+        }
+        if !pixelParts.isEmpty {
+            pixelValues = concatenated(pixelParts)
+        }
+
+        // Merge image features into the remainder's token embeddings — once,
+        // over the whole remainder; chunks slice the merged embeddings below.
+        var inputEmbeddings: MLXArray?
+        if let pixelValues,
+            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+                .nilIfEmpty
+        {
+            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let visionFeatures = visionHidden.asType(textEmbeds.dtype)
+            let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                imageFeatures: visionFeatures,
+                inputEmbeds: textEmbeds,
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex
+            )
+            inputEmbeddings = mergedEmbeds
+        }
+
+        // Offset-aware M-RoPE positions for the whole remainder — once. The new
+        // image's t/h/w indices diverge from the anchor; the returned delta is
+        // in the same offset frame.
+        let (positionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: input.text.mask,
+            positionOffset: positionOffset
+        )
+
+        // Chunk the forward. Each window forwards `chunk` query tokens against
+        // the growing cache, so the full-attention scratch stays `[heads,
+        // chunk, L]`. Intermediate logits are dropped un-evaluated (only the
+        // cache is realized between windows), so `lm_head` never materializes a
+        // `[1, L, vocab]` tensor.
+        let typedCache = castCache(cache)
+        let step = max(1, windowSize)
+        var lastLogits: MLXArray?
+        var start = 0
+        while start < remainderLength {
+            try Task.checkCancellation()
+            let end = min(start + step, remainderLength)
+            let chunkInputs = inputIds[0..., start ..< end]
+            let chunkEmbeds = inputEmbeddings.map { $0[0..., start ..< end, 0...] }
+            let chunkPositions = positionIds[0..., 0..., start ..< end]
+            let output = languageModel(
+                chunkInputs,
+                inputsEmbeds: chunkEmbeds,
+                cache: typedCache,
+                state: nil,
+                mask: nil,
+                positionIds: chunkPositions,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil
+            )
+            lastLogits = output.logits
+            if let typedCache {
+                eval(typedCache)
+            }
+            start = end
+        }
+
+        // Seed the post-image text tail's anchor. The vendor's flat-continuation
+        // branch positions tail token j at `tailCacheOffset + ropeDeltas + j`;
+        // after this remainder `tailCacheOffset = P + remainderLength`, so the
+        // delta the tail needs is the offset-frame `getRopeIndex` delta minus
+        // `P` (which `getRopeIndex` implicitly counted into `remainderLength`).
+        var resumeState = LMOutput.State()
+        resumeState[ropeDeltasKey] = ropeDeltas - MLXArray(Int32(cacheOffset))
+
+        guard let lastLogits else {
+            throw Qwen35VLError.featureTokenMismatch(expected: remainderLength, actual: 0)
+        }
+        return .logits(LMOutput(logits: lastLogits, state: resumeState))
+    }
+
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
@@ -1134,3 +1273,6 @@ extension Qwen35 {
         return castCache(cache)
     }
 }
+
+// `prepareContinuation` is defined on `Qwen35` above; `Qwen35MoE` inherits it.
+extension Qwen35: WindowedVisionContinuation {}

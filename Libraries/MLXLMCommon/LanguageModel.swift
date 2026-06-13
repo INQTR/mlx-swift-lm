@@ -202,6 +202,32 @@ public enum PrepareResult {
     case logits(LMOutput)
 }
 
+/// Opt-in capability for a vision language model that can continue an already
+/// warmed KV cache *through* a new image, without recomputing the cached
+/// prefix and without the single-shot `[heads, L, L]` full-attention scratch
+/// that `prepare` allocates (which OOMs on long image prompts).
+///
+/// Unlike `prepare` — which ignores `windowSize` and forwards the whole prompt
+/// in one pass — `prepareContinuation` honors `windowSize`: it runs the vision
+/// tower and the image→token merge once, then drives the language-model forward
+/// in windows, bounding the scratch to `[heads, windowSize, L]`. Only families
+/// that have wired the windowed image path conform; callers feature-detect via
+/// `as? WindowedVisionContinuation`.
+public protocol WindowedVisionContinuation {
+    /// Continue `cache` (warmed to its current offset `P`) through `input`'s
+    /// image-bearing remainder, in windows of `windowSize`.
+    ///
+    /// - Parameter state: carries the Position Anchor's rope delta for the
+    ///   images cached before `P` (absent / zero for an image-free prefix). The
+    ///   new image's M-RoPE positions are computed from that anchor instead of
+    ///   resetting to zero.
+    /// - Returns: `.logits` whose `state` carries the rope delta the post-image
+    ///   text tail resumes with, for a caller threading state end-to-end.
+    func prepareContinuation(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, windowSize: Int
+    ) throws -> PrepareResult
+}
+
 /// Interface for all Language Models (e.g. LLM, VLM).
 ///
 /// The language model is typically called by the ``TokenIterator`` and it:
