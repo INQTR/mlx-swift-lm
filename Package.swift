@@ -36,7 +36,15 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        // TODO(mlx-uaf): TEMPORARY fork pin — revert to upstream ml-explore/mlx-swift
+        // (e.g. .upToNextMinor(from: "0.31.4")) once the upstream fix ships in a release.
+        //   Upstream PR:    https://github.com/ml-explore/mlx/pull/3688
+        //   Upstream issue: https://github.com/ml-explore/mlx/issues/3689
+        // Fork carries retained command-buffer references (spokvulcan/mlx@d825d73), which
+        // stops the buffer-cache use-after-free crash (kIOGPUCommandBufferCallbackErrorInvalidResource):
+        // the allocator's cache trim could free an MTLBuffer still referenced by an
+        // in-flight, unretained command buffer. Must match mlx-audio-swift's pin exactly.
+        .package(url: "https://github.com/spokvulcan/mlx-swift", revision: "2c5365407776c12b75814802ef2ccc0f39e40d47"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
     ],
     targets: [
