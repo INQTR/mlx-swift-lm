@@ -33,6 +33,19 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
     }
 
+    /// Pixels for the default 2,560 vision-token budget (`2560 * factor²`),
+    /// clamped to `ceiling`. Overflow-safe: a pathological config (an absurd
+    /// `patch_size`/`merge_size`) yields `ceiling` instead of trapping on the
+    /// unchecked multiply, so bad model metadata degrades to the config ceiling
+    /// rather than crashing preprocess (tesseract ADR-0014).
+    private static func defaultVisionTokenBudgetPixels(factor: Int, ceiling: Int) -> Int {
+        let (squared, squaredOverflow) = factor.multipliedReportingOverflow(by: factor)
+        guard !squaredOverflow else { return ceiling }
+        let (budget, budgetOverflow) = squared.multipliedReportingOverflow(by: 2560)
+        guard !budgetOverflow else { return ceiling }
+        return min(ceiling, budget)
+    }
+
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         MLXArray, THW
     ) {
@@ -52,12 +65,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         // mirroring the sibling Qwen25VL. An explicit `processing.maxPixels`
         // overrides it (ADR-0008). (tesseract ADR-0014.)
         let factor = config.patchSize * config.mergeSize
-        let maxPixels = processing?.maxPixels ?? min(config.size.maxPixels, 2560 * factor * factor)
+        let maxPixels =
+            processing?.maxPixels
+            ?? Self.defaultVisionTokenBudgetPixels(factor: factor, ceiling: config.maxPixels)
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
             height: Int(extent.height),
             width: Int(extent.width),
             factor: factor,
-            minPixels: processing?.minPixels ?? config.size.minPixels,
+            minPixels: processing?.minPixels ?? config.minPixels,
             maxPixels: maxPixels)
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
@@ -132,7 +147,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                         let factor = config.patchSize * config.mergeSize
                         let maxPixels =
                             input.processing.maxPixels
-                            ?? min(config.maxPixels, 2560 * factor * factor)
+                            ?? Self.defaultVisionTokenBudgetPixels(
+                                factor: factor, ceiling: config.maxPixels)
                         let (height, width) = try QwenVL.targetSize(
                             height: Int(size.height),
                             width: Int(size.width),
