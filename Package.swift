@@ -58,7 +58,19 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        // Exact-revision pin: 0bb916c IS the 0.31.6 tag, so this satisfies the
+        // .upToNextMinor(from: "0.31.4") requirement upstream declares (0.31.6 is
+        // the floor in practice: upstream now uses MLXArray.maskFill (0.31.5) and
+        // DType.greatestFiniteMagnitudeArray (0.31.6)). The pin must match the
+        // tesseract app's other vendored packages (mlx-audio-swift,
+        // tesseract-speech) exactly — SwiftPM cannot mix two different
+        // revision-based requirements for the same package in one graph, so
+        // every pin moves in lockstep.
+        // (The retained command-buffer fork formerly pinned here was dropped:
+        // the UAF crash was app-side, fixed by HybridCacheSnapshot.deepCopyState.)
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift",
+            revision: "0bb916c67f4b9e5c682cbe02a42c701c93ab5021"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
