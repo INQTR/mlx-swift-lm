@@ -58,7 +58,15 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        // Exact-revision pin: dc43e62 IS the v0.31.4 tag, so this satisfies the
+        // .upToNextMinor(from: "0.31.4") requirement upstream declares. The pin
+        // must match mlx-audio-swift exactly — SwiftPM cannot mix a revision-based
+        // and a version-based requirement for the same package in one graph.
+        // (The retained command-buffer fork formerly pinned here was dropped:
+        // the UAF crash was app-side, fixed by HybridCacheSnapshot.deepCopyState.)
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift",
+            revision: "dc43e62d7055353c7f99fa071a4e71d29dfddc44"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
