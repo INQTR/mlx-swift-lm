@@ -36,15 +36,21 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        // TODO(mlx-uaf): TEMPORARY fork pin — revert to upstream ml-explore/mlx-swift
-        // (e.g. .upToNextMinor(from: "0.31.4")) once the upstream fix ships in a release.
-        //   Upstream PR:    https://github.com/ml-explore/mlx/pull/3688
-        //   Upstream issue: https://github.com/ml-explore/mlx/issues/3689
-        // Fork carries retained command-buffer references (spokvulcan/mlx@d825d73), which
-        // stops the buffer-cache use-after-free crash (kIOGPUCommandBufferCallbackErrorInvalidResource):
-        // the allocator's cache trim could free an MTLBuffer still referenced by an
-        // in-flight, unretained command buffer. Must match mlx-audio-swift's pin exactly.
-        .package(url: "https://github.com/spokvulcan/mlx-swift", revision: "2c5365407776c12b75814802ef2ccc0f39e40d47"),
+        // Upstream ml-explore/mlx-swift. The retained command-buffer fork
+        // (spokvulcan/mlx-swift) formerly pinned here has been dropped.
+        // Investigation showed the kIOGPUCommandBufferCallbackErrorInvalidResource
+        // crash was NOT an MLX-core bug: mlx::core::gpu::eval() already retains
+        // each op's inputs/siblings (shared_ptr<array::Data>) in the command
+        // buffer's completion handler, so a tracked buffer cannot be freed while
+        // its CB is in flight. The real cause was app-side —
+        // HybridCacheSnapshot.capture()/restore() aliased live KV buffers via
+        // array[.ellipsis], letting the allocator recycle a buffer still
+        // referenced by an in-flight CB under memory pressure. Fixed app-side
+        // by HybridCacheSnapshot.deepCopyState (true deep copy), which makes
+        // the retained-CB fork unnecessary. Upstream PR #3688 / issue #3689
+        // were closed by the maintainer with the same conclusion. Pin matches
+        // mlx-audio-swift exactly (SwiftPM needs one consistent revision).
+        .package(url: "https://github.com/ml-explore/mlx-swift", revision: "dc43e62d7055353c7f99fa071a4e71d29dfddc44"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
     ],
     targets: [
