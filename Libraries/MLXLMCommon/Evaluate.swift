@@ -115,6 +115,12 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Token ids that must never be sampled — logits are masked to `-inf`
+    /// every step. Mirrors `generation_config.json`'s `suppress_tokens`
+    /// (e.g. Gemma 4 marks its end-of-image / end-of-audio delimiters
+    /// generate-time-forbidden). Empty disables the mask.
+    public var suppressedTokens: [Int] = []
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -133,7 +139,8 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int? = nil,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        suppressedTokens: [Int] = []
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -153,6 +160,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
         self.seed = seed
+        self.suppressedTokens = suppressedTokens
     }
 
     public func sampler() -> LogitSampler {
@@ -201,15 +209,26 @@ public struct GenerateParameters: Sendable {
             frequencyContext = nil
         }
 
+        let penalties: PenaltyProcessor?
         if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
-            return nil
+            penalties = nil
+        } else {
+            penalties = PenaltyProcessor(
+                repetitionContext: repetitionContext,
+                presenceContext: presenceContext,
+                frequencyContext: frequencyContext
+            )
         }
 
-        return PenaltyProcessor(
-            repetitionContext: repetitionContext,
-            presenceContext: presenceContext,
-            frequencyContext: frequencyContext
-        )
+        let suppressed: SuppressedTokensProcessor? =
+            suppressedTokens.isEmpty ? nil : SuppressedTokensProcessor(tokens: suppressedTokens)
+
+        switch (penalties, suppressed) {
+        case (nil, nil): return nil
+        case (let p?, nil): return p
+        case (nil, let s?): return s
+        case (let p?, let s?): return ChainedLogitProcessor(processors: [p, s])
+        }
     }
 }
 
@@ -513,6 +532,53 @@ public struct PenaltyProcessor: LogitProcessor {
         repetitionContext?.didSample(token: token)
         presenceContext?.didSample(token: token)
         frequencyContext?.didSample(token: token)
+    }
+}
+
+/// Processor that masks a fixed set of token ids to `-inf` so they can never
+/// be sampled. Implements `generation_config.json`'s `suppress_tokens`
+/// (Gemma 4 lists its end-of-image / end-of-audio delimiters there — without
+/// the mask the model can emit them spuriously mid-generation).
+public struct SuppressedTokensProcessor: LogitProcessor {
+    /// `[1, n]` uint32 — shaped for `putAlong(_:axis: -1)` on `[1, vocab]` logits.
+    private let indices: MLXArray
+    /// `[1, n]` float32 `-inf`, cast to the logits dtype at process time.
+    private let negativeInfinity: MLXArray
+
+    public init(tokens: [Int]) {
+        precondition(!tokens.isEmpty, "SuppressedTokensProcessor requires at least one token")
+        self.indices = MLXArray(tokens.map { UInt32($0) })[.newAxis, 0...]
+        self.negativeInfinity = MLXArray(
+            Array(repeating: -Float.infinity, count: tokens.count))[.newAxis, 0...]
+    }
+
+    public mutating func prompt(_ prompt: MLXArray) {}
+
+    public func process(logits: MLXArray) -> MLXArray {
+        putAlong(logits, indices, values: negativeInfinity.asType(logits.dtype), axis: -1)
+    }
+
+    public mutating func didSample(token: MLXArray) {}
+}
+
+/// Processor that runs an ordered list of processors over the same logits.
+public struct ChainedLogitProcessor: LogitProcessor {
+    private var processors: [any LogitProcessor]
+
+    public init(processors: [any LogitProcessor]) {
+        self.processors = processors
+    }
+
+    public mutating func prompt(_ prompt: MLXArray) {
+        for index in processors.indices { processors[index].prompt(prompt) }
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        processors.reduce(logits) { $1.process(logits: $0) }
+    }
+
+    public mutating func didSample(token: MLXArray) {
+        for index in processors.indices { processors[index].didSample(token: token) }
     }
 }
 
