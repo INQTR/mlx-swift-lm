@@ -412,6 +412,28 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // C11 (tesseract): run decode through a compiled closure — the
+        // router chain (takeAlong/sum/divide), shared-expert gating
+        // (sigmoid+multiply) and the residuals fuse into fewer kernels,
+        // shortening the GPU serial chain ~10 ops/layer/token. Fusion is
+        // the E2-proven-bitwise class (per-op output rounding preserved);
+        // non-fusable primitives (matmuls, gathers, custom kernels) tape
+        // through unchanged. Traced once at warmup and replayed after.
+        // Prefill takes the unfused body: it is GEMM-dominated (fusion
+        // measured +0.3% at 8K) and the per-shape compile-trace cost is
+        // real on short prompts (−5% at 128 ctx).
+        if x.dim(1) != 1 {
+            return forward(x)
+        }
+        if compiledForward == nil {
+            compiledForward = compile { [self] x in forward(x) }
+        }
+        return compiledForward!(x)
+    }
+
+    private var compiledForward: ((MLXArray) -> MLXArray)?
+
+    private func forward(_ x: MLXArray) -> MLXArray {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
