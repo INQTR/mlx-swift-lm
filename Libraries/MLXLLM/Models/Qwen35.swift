@@ -352,10 +352,38 @@ final class Qwen35GatedDeltaNet: Module {
         let b = inProjB(x)
         let a = inProjA(x)
 
-        let convInput = concatenated([convState, qkv], axis: 1)
-        let newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
+        // C16 (tesseract): at S == 1 the depthwise conv is a fixed
+        // `convKernelSize`-term dot per channel, so it can be written as
+        // elementwise multiply-adds that `compile` folds into the surrounding
+        // segment — one fewer dispatch *and* one fewer hazard barrier per GDN
+        // layer, the barrier being the expensive half (the whole decode step
+        // is ~972 barriers deep; see the ledger's roofline entry). The
+        // accumulation must run in f32 and round once at the end: that is what
+        // MLX's Convolution kernel does, and it reproduces its output
+        // bit-for-bit (probe: 8192 channels, f16 and bf16, dtype-accumulation
+        // differs in ~47% of channels, f32-accumulation identical in all).
+        let convTail = convState[0..., 1..., 0...]
+        let newConvState =
+            S == 1
+            ? concatenated([convTail, qkv], axis: 1)
+            : contiguous(
+                concatenated([convState, qkv], axis: 1)[
+                    0..., (-(convKernelSize - 1))..., 0...])
 
-        let convOut = silu(conv1d(convInput))
+        let convOut: MLXArray
+        if S == 1 {
+            var acc = convState[0..., 0, 0...].asType(.float32)
+                * conv1d.weight[0..., 0, 0].asType(.float32)
+            for tap in 1 ..< convKernelSize {
+                let row =
+                    tap < convKernelSize - 1
+                    ? convState[0..., tap, 0...] : qkv[0..., 0, 0...]
+                acc = acc + row.asType(.float32) * conv1d.weight[0..., tap, 0].asType(.float32)
+            }
+            convOut = silu(acc.asType(qkv.dtype).reshaped(B, S, convDim))
+        } else {
+            convOut = silu(conv1d(concatenated([convState, qkv], axis: 1)))
+        }
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
