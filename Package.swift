@@ -59,14 +59,14 @@ let package = Package(
     ],
     dependencies: [
         // Exact-revision pin on the spokvulcan/mlx-swift fork, branch
-        // pin-tesseract: c9796ec4 = 3bd912db (0bb916c + .gitmodules
+        // pin-tesseract: e20b0d86 = 3bd912db (0bb916c + .gitmodules
         // provenance) + the Cmlx gitlink bumps carrying the accepted
         // mlx-core experiments (rpe-aware gather_qmm_rhs tiles fbf2fb86;
         // commit-accounting split 404070e2; per-cbuf retention coalescing
         // 8d11dd1d; custom-kernel source memo 3ec72a24; runtime commit
         // policy 6ab29e36 + GPU.setCommitLimits surface; eval_impl
         // flat degree map 595a3fe1; gather identity-index cache
-        // 625f2aea).
+        // 625f2aea; fused causal-mask+softmax ed107a94).
         // 0bb916c satisfies the .upToNextMinor(from: "0.31.4") requirement
         // upstream declares (0.31.6 is the floor in practice: upstream now
         // uses MLXArray.maskFill (0.31.5) and
@@ -79,7 +79,7 @@ let package = Package(
         // the UAF crash was app-side, fixed by HybridCacheSnapshot.deepCopyState.)
         .package(
             url: "https://github.com/spokvulcan/mlx-swift",
-            revision: "c9796ec4138d30cb94eae7aec221290e5432ee6f"),
+            revision: "e20b0d866ad622f538dc5ba2363696a9213e36d1"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
