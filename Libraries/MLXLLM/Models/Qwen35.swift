@@ -233,6 +233,33 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
+        // C12 (tesseract): compiled decode step — the conv/gating/norm
+        // elementwise chains fuse (E2-bitwise class), shortening the GPU
+        // serial chain. Cache state crosses the boundary explicitly
+        // (compiled functions must be pure); prefill and masked/cacheless
+        // calls keep the unfused body (GEMM-dominated, per-shape trace
+        // cost).
+        if S == 1, let cache, mask == nil {
+            if compiledDecode == nil {
+                compiledDecode = compile {
+                    [self] (x: MLXArray, convState: MLXArray, recState: MLXArray) in
+                    decodeForward(x: x, convState: convState, recState: recState)
+                }
+            }
+            let convState =
+                cache[0]
+                ?? MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
+            let recState =
+                cache[1]
+                ?? MLXArray.zeros([B, numVHeads, headVDim, headKDim], dtype: .float32)
+            let (out, newConvState, newRecState) = compiledDecode!(
+                inputs, convState, recState)
+            cache[0] = newConvState
+            cache[1] = newRecState
+            cache.advance(S)
+            return out
+        }
+
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
         let b = inProjB(inputs)
@@ -292,6 +319,59 @@ final class Qwen35GatedDeltaNet: Module {
 
         out = norm(out, gate: z)
         return outProj(out.reshaped(B, S, -1))
+    }
+
+    private var compiledDecode: ((MLXArray, MLXArray, MLXArray) -> (
+        MLXArray, MLXArray, MLXArray
+    ))?
+
+    /// The decode-step GDN body with explicit state in/out — traced once by
+    /// `compiledDecode`. Bit-identical to the unfused `callAsFunction` path
+    /// for S == 1 / mask == nil; fusion only merges elementwise chains.
+    private func decodeForward(
+        x: MLXArray, convState: MLXArray, recState: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let B = x.dim(0)
+        let S = x.dim(1)
+
+        let qkv = inProjQKV(x)
+        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(x)
+        let a = inProjA(x)
+
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
+
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (out, newRecState) = gatedDeltaUpdate(
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            aLog: aLog,
+            dtBias: dtBias,
+            state: recState,
+            mask: nil
+        )
+
+        let gated = norm(out, gate: z)
+        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState)
     }
 }
 
