@@ -241,8 +241,16 @@ final class Qwen35GatedDeltaNet: Module {
         // cost).
         if S == 1, let cache, mask == nil {
             if compiledDecode == nil {
+                // [self]: the closure lives only in `compiledDecode`
+                // on self, so it cannot outlive self — while a strong capture
+                // cycles (self → compiledDecode → CompiledFunction → closure
+                // → self) and leaks the block, its weights, and the compiled
+                // mlx tape on every model release. Note the trace also bakes
+                // the weights captured at first trace: swapping parameters on
+                // a live module would silently replay stale weights —
+                // recreate the module instead.
                 compiledDecode = compile {
-                    [self] (x: MLXArray, convState: MLXArray, recState: MLXArray) in
+                    [unowned self] (x: MLXArray, convState: MLXArray, recState: MLXArray) in
                     decodeForward(x: x, convState: convState, recState: recState)
                 }
             }
@@ -321,9 +329,12 @@ final class Qwen35GatedDeltaNet: Module {
         return outProj(out.reshaped(B, S, -1))
     }
 
-    private var compiledDecode: ((MLXArray, MLXArray, MLXArray) -> (
-        MLXArray, MLXArray, MLXArray
-    ))?
+    private var compiledDecode:
+        (
+            (MLXArray, MLXArray, MLXArray) -> (
+                MLXArray, MLXArray, MLXArray
+            )
+        )?
 
     /// The decode-step GDN body with explicit state in/out — traced once by
     /// `compiledDecode`. Bit-identical to the unfused `callAsFunction` path
@@ -506,7 +517,15 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
             return forward(x)
         }
         if compiledForward == nil {
-            compiledForward = compile { [self] x in forward(x) }
+            // [self]: the closure lives only in `compiledForward` on
+            // self, so it cannot outlive self — while a strong capture cycles
+            // (self → compiledForward → CompiledFunction → closure → self)
+            // and leaks the block, its expert weights, and the compiled mlx
+            // tape on every model release. The trace bakes the weights
+            // captured at first trace: swapping parameters on a live module
+            // would silently replay stale weights — recreate the module
+            // instead.
+            compiledForward = compile { [unowned self] x in forward(x) }
         }
         return compiledForward!(x)
     }
