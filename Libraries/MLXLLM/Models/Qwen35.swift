@@ -52,7 +52,7 @@ private let routerTopKSource = """
 
     threadgroup ulong sk[E_];
     threadgroup float top_v[K_];
-    threadgroup int   top_i[K_];
+    threadgroup uint  top_i[K_];
 
     float v = static_cast<float>(gates[row * E_ + t]);
     uint b = (v == 0.0f) ? 0u : as_type<uint>(v);
@@ -67,7 +67,7 @@ private let routerTopKSource = """
     }
     if (above < K_) {
         top_v[K_ - 1 - above] = v;
-        top_i[K_ - 1 - above] = (int)t;
+        top_i[K_ - 1 - above] = t;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -88,7 +88,7 @@ private let routerTopKSource = """
 
 private final class RouterTopKKernel: Sendable {
     static let shared = RouterTopKKernel()
-    let kernel: MLXFast.MLXFastKernel?
+    let kernel: MLXFast.MLXFastKernel
 
     private init() {
         kernel = MLXFast.metalKernel(
@@ -102,17 +102,20 @@ private final class RouterTopKKernel: Sendable {
 
 /// Top-`k` selection + optional normalisation over the last axis, in one
 /// dispatch. Returns `(indices, scores)` shaped `[..., k]`, matching the
-/// argPartition/takeAlong/normalise chain bit for bit.
+/// argPartition/takeAlong/normalise chain bit for bit — including the
+/// `uint32` index dtype `argPartition` produces.
 ///
 /// One threadgroup per row and an `O(E²)` rank count, which is only the right
 /// shape when there are very few rows — at prefill the block sort's
 /// `O(E log² E)` wins and there is no barrier to save, so callers gate this on
 /// the single-row decode case.
-private func fusedRouterTopK(_ gates: MLXArray, k: Int, normalize: Bool) -> (MLXArray, MLXArray)? {
-    guard let kernel = RouterTopKKernel.shared.kernel else { return nil }
+///
+/// Internal (not private) so `Qwen35BitwiseContractTests` can hold the fused
+/// form against the chain it replaces.
+func fusedRouterTopK(_ gates: MLXArray, k: Int, normalize: Bool) -> (MLXArray, MLXArray) {
     let e = gates.dim(-1)
     let rows = gates.size / e
-    let out = kernel(
+    let out = RouterTopKKernel.shared.kernel(
         [gates],
         template: [
             ("T", gates.dtype), ("E_", e), ("K_", k), ("NORM_", normalize ? 1 : 0),
@@ -120,7 +123,7 @@ private func fusedRouterTopK(_ gates: MLXArray, k: Int, normalize: Bool) -> (MLX
         grid: (e, rows, 1),
         threadGroup: (e, 1, 1),
         outputShapes: [[rows, k], [rows, k]],
-        outputDTypes: [.int32, gates.dtype]
+        outputDTypes: [.uint32, gates.dtype]
     )
     return (out[0], out[1])
 }
@@ -346,41 +349,6 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        // C12 (tesseract): compiled decode step — the conv/gating/norm
-        // elementwise chains fuse (E2-bitwise class), shortening the GPU
-        // serial chain. Cache state crosses the boundary explicitly
-        // (compiled functions must be pure); prefill and masked/cacheless
-        // calls keep the unfused body (GEMM-dominated, per-shape trace
-        // cost).
-        if S == 1, let cache, mask == nil {
-            if compiledDecode == nil {
-                // [self]: the closure lives only in `compiledDecode`
-                // on self, so it cannot outlive self — while a strong capture
-                // cycles (self → compiledDecode → CompiledFunction → closure
-                // → self) and leaks the block, its weights, and the compiled
-                // mlx tape on every model release. Note the trace also bakes
-                // the weights captured at first trace: swapping parameters on
-                // a live module would silently replay stale weights —
-                // recreate the module instead.
-                compiledDecode = compile {
-                    [unowned self] (x: MLXArray, convState: MLXArray, recState: MLXArray) in
-                    decodeForward(x: x, convState: convState, recState: recState)
-                }
-            }
-            let convState =
-                cache[0]
-                ?? MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
-            let recState =
-                cache[1]
-                ?? MLXArray.zeros([B, numVHeads, headVDim, headKDim], dtype: .float32)
-            let (out, newConvState, newRecState) = compiledDecode!(
-                inputs, convState, recState)
-            cache[0] = newConvState
-            cache[1] = newRecState
-            cache.advance(S)
-            return out
-        }
-
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
         let b = inProjB(inputs)
@@ -442,18 +410,13 @@ final class Qwen35GatedDeltaNet: Module {
         return outProj(out.reshaped(B, S, -1))
     }
 
-    private var compiledDecode:
-        (
-            (MLXArray, MLXArray, MLXArray) -> (
-                MLXArray, MLXArray, MLXArray
-            )
-        )?
-
-    /// The decode-step GDN body with explicit state in/out — traced once by
-    /// `compiledDecode`, and by the enclosing layer's whole-layer trace
-    /// (C14 milestone B), which subsumes it. Bit-identical to the unfused
-    /// `callAsFunction` path for S == 1 / mask == nil; fusion only merges
-    /// elementwise chains.
+    /// The decode-step GDN body with explicit state in/out — traced by the
+    /// enclosing layer's whole-layer trace (C14 milestone B) or by a
+    /// whole-step segment (milestone C). This is C12's compiled body; C14
+    /// subsumed the module-local compiled wrapper it originally shipped with,
+    /// so every S == 1 decode now reaches this through the layer above.
+    /// Bit-identical to the unfused `callAsFunction` path for S == 1 /
+    /// mask == nil; fusion only merges elementwise chains.
     func decodeForward(
         x: MLXArray, convState: MLXArray, recState: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray) {
@@ -746,9 +709,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     /// count the wrong shape, and a GEMM-bound pass has no barrier to save.
     private func routerTopK(_ gates: MLXArray, k: Int) -> (MLXArray, MLXArray) {
         let e = gates.dim(-1)
-        if gates.size == e, e <= 1024,
+        if gates.size == e, e <= 1024 {
             let (inds, scores) = fusedRouterTopK(gates, k: k, normalize: normTopkProb)
-        {
             var shape = gates.shape
             shape[shape.count - 1] = k
             return (inds.reshaped(shape), scores.reshaped(shape))
