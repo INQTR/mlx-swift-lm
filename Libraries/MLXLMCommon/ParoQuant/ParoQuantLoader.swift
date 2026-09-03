@@ -150,7 +150,7 @@ private func splitFusedMambaProjections(_ weights: inout [String: MLXArray]) {
 ///
 /// Internal (not private) so the conversion contract is unit-testable.
 func convertAutoAWQ(
-    _ weights: inout [String: MLXArray], groupSize: Int
+    _ weights: inout [String: MLXArray], groupSize: Int, floatDType: DType
 ) {
     // Every `.qweight` prefix converts, with or without a sibling `theta`:
     // MoE per-expert weights carry no theta (their rotations are shared per
@@ -163,13 +163,11 @@ func convertAutoAWQ(
 
     guard !prefixes.isEmpty else { return }
 
-    // Both scales and biases are cast to the checkpoint's float dtype, read
-    // once from a rotation tensor (`theta` / `channel_scales`, present in every
-    // PARO checkpoint and stored in the model's activation dtype). AWQ ships
-    // f32 scales while `quantizedMM` promotes to the widest of x / scales /
-    // biases, so leaving them mismatched runs the matmul in f32 (upstream fix
-    // z-lab/paroquant#38 pinned f16, which is wrong for a bf16 checkpoint).
-    let floatDType = checkpointFloatDType(weights)
+    // Scales and biases are cast to `floatDType`, the checkpoint's activation
+    // dtype: `quantizedMM` promotes to the widest of x / scales / biases, so
+    // scales that don't match the activations run every matmul in f32
+    // (z-lab/paroquant#38 pinned f16 for that reason; a bf16 checkpoint needs
+    // bf16).
 
     // Pass 1: compute biases from qzeros + scales BEFORE scales are transposed.
     for pfx in prefixes {
@@ -207,21 +205,22 @@ func convertAutoAWQ(
     }
 }
 
-/// The dtype the checkpoint keeps its floating-point tensors in — read from
-/// a rotation tensor (dense `.theta` / shared MoE `_theta`, then
-/// `channel_scales`), the one float tensor family every PARO checkpoint
-/// carries. Falls back to float16, the only dtype z-lab has shipped.
+/// The dtype the checkpoint keeps its float tensors in, read from a rotation
+/// tensor (dense `.theta` / shared MoE `_theta`, else `channel_scales`) —
+/// the float family every PARO checkpoint carries, stored in the model's
+/// activation dtype. `config.json` is not a substitute: the z-lab
+/// checkpoints declare the pre-quantization `bfloat16` while shipping f16.
+/// The lowest matching key is used so the answer is deterministic. Nil when
+/// no rotation tensor exists.
 ///
 /// Internal (not private) so the conversion contract is unit-testable.
-func checkpointFloatDType(_ weights: [String: MLXArray]) -> DType {
+func checkpointFloatDType(_ weights: [String: MLXArray]) -> DType? {
     for suffix in ["theta", "channel_scales"] {
-        if let key = weights.keys.first(where: { $0.hasSuffix(suffix) }),
-            let dtype = weights[key]?.dtype, dtype.isFloatingPoint
-        {
-            return dtype
+        if let key = weights.keys.filter({ $0.hasSuffix(suffix) }).min() {
+            return weights[key]?.dtype
         }
     }
-    return .float16
+    return nil
 }
 
 // MARK: - MoE Passes
@@ -677,7 +676,9 @@ public func loadParoQuantModel<T: LanguageModel>(
 
         // 6. Convert AutoAWQ format → MLX format (BEFORE sanitize)
         if weights.keys.contains(where: { $0.hasSuffix(".qweight") }) {
-            convertAutoAWQ(&weights, groupSize: paroConfig.groupSize)
+            convertAutoAWQ(
+                &weights, groupSize: paroConfig.groupSize,
+                floatDType: checkpointFloatDType(weights) ?? .float16)
             logger.info("Converted AutoAWQ weights to MLX format")
         }
         markPhase("convertGraph")
@@ -838,7 +839,7 @@ public enum ParoQuantError: LocalizedError {
         case .missingConfig:
             return "Missing quantization_config in config.json for ParoQuant model"
         case .unsupportedModel:
-            return "The custom ParoQuant loader only supports z-lab/Qwen3.5-4B-PARO"
+            return "config.json does not declare a supported ParoQuant architecture"
         case .missingTensor(let key):
             return "Missing required ParoQuant tensor: \(key)"
         case .invalidTensorShape(let key, let expected, let actual):

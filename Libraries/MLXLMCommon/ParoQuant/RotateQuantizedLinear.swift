@@ -56,6 +56,11 @@ open class RotateQuantizedLinear: QuantizedLinear, RotationStatePreparing {
             groupSize: groupSize,
             bits: bits
         )
+
+        // The array-passing `QuantizedLinear` initializer does not freeze
+        // (only the quantizing one does); rotation and quantization
+        // parameters alike are checkpoint constants, never trained.
+        self.freeze()
     }
 
     /// See `RotationStatePreparing` — loader-owned, results batched into a

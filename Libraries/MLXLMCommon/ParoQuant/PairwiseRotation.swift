@@ -2,58 +2,58 @@ import Foundation
 import MLX
 import MLXNN
 
-// MARK: - Metal Kernel Source
+// MARK: - Metal Kernel Sources
+//
+// Both kernels are template kernels: `T` (activation dtype), `ROWS_PER_TILE`,
+// `KROT` and — for the generic one — `GROUP_SIZE` arrive as MLX template
+// arguments, so MLX instantiates and memoizes one specialisation per
+// (dtype, geometry) itself, the same way the router top-k and GatedDelta
+// kernels in this module work.
 
-/// Pairwise Givens rotation kernel for Metal (Apple Silicon).
-/// Template parameters are substituted at compile time.
+/// Pairwise Givens rotation kernel for Metal (Apple Silicon), groupSize 128.
 ///
 /// One CTA is a single simdgroup (32 lanes) per (row-tile, channel-group):
 ///
 /// - Each lane caches the cos/sin/pair coefficients of its two pair slots
-///   (lane, lane+32) for every round in registers. `krot` is a compile-time
-///   constant, so these are constant-index register arrays — the old kernel
-///   indexed its coefficient arrays by a runtime loop bound, which pushed
-///   them into local (DRAM-backed) memory.
+///   (lane, lane+32) for every round in registers. `KROT` is a compile-time
+///   constant, so these are constant-index register arrays — a runtime loop
+///   bound would push them into local (DRAM-backed) memory.
 /// - Per-round sync is `simdgroup_barrier(mem_threadgroup)` instead of
 ///   `threadgroup_barrier` — with a one-simdgroup CTA there is no
 ///   cross-simdgroup rendezvous to pay for. The tile layout is row-major
 ///   (`tile[row * 128 + ch]`), so pair accesses are bank-conflict-free
-///   for any ROWS_PER_TILE (the old channel-major `tile[ch * R + row]`
-///   layout collapsed onto 8 banks for R = 4).
-/// - x/out IO is vectorized (`\(t4)` per lane covers the 128-channel
+///   for any ROWS_PER_TILE (a channel-major `tile[ch * R + row]` layout
+///   collapses onto 8 banks for R = 4).
+/// - x/out IO is vectorized (`vec<T, 4>` per lane covers the 128-channel
 ///   group exactly); the f32 threadgroup tile is written/read as float4.
 ///   `channel_scales` is loaded scalar + converted so its dtype may
 ///   legitimately differ from the activation dtype.
-/// - The write-back casts explicitly (`\(t)(...)`) so the same source
-///   instantiates for float16, bfloat16 and float32.
+/// - The write-back casts explicitly (`T(...)`), which is what lets the same
+///   source instantiate for float16, bfloat16 and float32.
 ///
 /// Correctness notes:
 /// - All lanes execute every barrier (no early returns; `row < batch_size`
 ///   guards wrap memory accesses only and are CTA-uniform).
-/// - The math is bit-identical to the old kernel per element: f32 loads of
-///   `float(x) * scale`, the same krot Givens rounds in order with the same
-///   pairs/cos/sin (`a * c + b * s`, `b * c - a * s` in f32), then one
+/// - The math is bit-identical to the generic kernel per element: f32 loads
+///   of `float(x) * scale`, the same krot Givens rounds in order with the
+///   same pairs/cos/sin (`a * c + b * s`, `b * c - a * s` in f32), then one
 ///   rounding to the element type on write-back.
-/// - Requires groupSize == 128 (64 pair slots per group = 2 per lane) and
-///   krot >= 1; both are enforced by `dispatchPairwiseRotation`.
-private func simdgroupMetalSource(
-    rowsPerTile: Int, krot: Int, elementType t: String, elementType4 t4: String
-) -> String {
-    """
-    constexpr int ROWS_PER_TILE = \(rowsPerTile);
-    constexpr int KROT          = \(krot);
+/// - Assumes groupSize == 128 (64 pair slots per group = 2 per lane);
+///   `dispatchPairwiseRotation` selects this kernel only for that size.
+private let simdgroupRotationSource = """
+    constexpr int GROUP_SIZE = 128;
 
-    const int batch_size  = params[0];
-    const int hidden_size = params[1];
-    const int group_size  = params[3];
+    // `x_shape` is MLX's auto-injected shape buffer for input `x` ([batch, dim]).
+    const int batch_size  = x_shape[0];
+    const int hidden_size = x_shape[1];
 
-    const int half_gs     = group_size / 2;
+    const int half_gs     = GROUP_SIZE / 2;
     const int half_hidden = hidden_size / 2;
 
     const int tile_idx  = threadgroup_position_in_grid.x;
     const int group_idx = threadgroup_position_in_grid.y;
     const int lane      = thread_index_in_threadgroup;
-    const int gbase     = group_idx * group_size;
+    const int gbase     = group_idx * GROUP_SIZE;
 
     // Rotation coefficients for this lane's two pair slots of every round
     float cos_vals[KROT][2], sin_vals[KROT][2];
@@ -68,7 +68,7 @@ private func simdgroupMetalSource(
         }
     }
 
-    threadgroup float tile[ROWS_PER_TILE * 128];
+    threadgroup float tile[ROWS_PER_TILE * GROUP_SIZE];
 
     // Load activation tile into shared memory (fuse channel scales).
     // Lane owns channels lane*4 .. lane*4+3 of the group.
@@ -79,13 +79,13 @@ private func simdgroupMetalSource(
     for (int r = 0; r < ROWS_PER_TILE; r++) {
         int row = tile_idx * ROWS_PER_TILE + r;
         if (row < batch_size) {
-            \(t4) xh = ((const device \(t4)*)(x + row * hidden_size + gbase))[lane];
+            vec<T, 4> xh = ((const device vec<T, 4>*)(x + row * hidden_size + gbase))[lane];
             float4 tv;
             tv[0] = float(xh[0]) * sc0;
             tv[1] = float(xh[1]) * sc1;
             tv[2] = float(xh[2]) * sc2;
             tv[3] = float(xh[3]) * sc3;
-            *(threadgroup float4*)(tile + r * 128 + lane * 4) = tv;
+            *(threadgroup float4*)(tile + r * GROUP_SIZE + lane * 4) = tv;
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -97,10 +97,10 @@ private func simdgroupMetalSource(
             int j_local = pair_vals[k][u] >> 16;
             float c = cos_vals[k][u], s = sin_vals[k][u];
             for (int m = 0; m < ROWS_PER_TILE; m++) {
-                float a = tile[m * 128 + i_local];
-                float b = tile[m * 128 + j_local];
-                tile[m * 128 + i_local] = a * c + b * s;
-                tile[m * 128 + j_local] = b * c - a * s;
+                float a = tile[m * GROUP_SIZE + i_local];
+                float b = tile[m * GROUP_SIZE + j_local];
+                tile[m * GROUP_SIZE + i_local] = a * c + b * s;
+                tile[m * GROUP_SIZE + j_local] = b * c - a * s;
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -110,111 +110,25 @@ private func simdgroupMetalSource(
     for (int r = 0; r < ROWS_PER_TILE; r++) {
         int row = tile_idx * ROWS_PER_TILE + r;
         if (row < batch_size) {
-            float4 tv = *(threadgroup float4*)(tile + r * 128 + lane * 4);
-            \(t4) ov;
-            ov[0] = \(t)(tv[0]);
-            ov[1] = \(t)(tv[1]);
-            ov[2] = \(t)(tv[2]);
-            ov[3] = \(t)(tv[3]);
-            *(device \(t4)*)(out + row * hidden_size + gbase + lane * 4) = ov;
+            float4 tv = *(threadgroup float4*)(tile + r * GROUP_SIZE + lane * 4);
+            vec<T, 4> ov;
+            ov[0] = T(tv[0]);
+            ov[1] = T(tv[1]);
+            ov[2] = T(tv[2]);
+            ov[3] = T(tv[3]);
+            *(device vec<T, 4>*)(out + row * hidden_size + gbase + lane * 4) = ov;
         }
     }
     """
-}
 
-// MARK: - Kernel Cache
-
-/// Metal scalar + 4-wide vector type names used for the rotation kernels'
-/// IO, or nil for dtypes the kernels are not instantiated for.
-private func rotationKernelTypeNames(_ dtype: DType) -> (String, String)? {
-    switch dtype {
-    case .float16: return ("half", "half4")
-    case .bfloat16: return ("bfloat16_t", "bfloat4")
-    case .float32: return ("float", "float4")
-    default: return nil
-    }
-}
-
-/// Cache key for the compiled rotation kernels. A value type rather than a
-/// formatted string: the lookup runs on every rotation dispatch (hundreds of
-/// times per token on a MoE model), so the key must hash without allocating.
-private struct RotationKernelKey: Hashable {
-    let tile: Int
-    let groupSize: Int
-    let krot: Int
-    let dtype: DType
-}
-
-/// Cached compiled Metal kernels keyed by tile size, group size, krot and IO
-/// dtype, guarded by `kernelCacheLock`. Callers are multi-threaded (each
-/// `ModelContainer.perform` closure can run on its own task), so the
-/// dictionary read-modify-write is serialised. Contention is practically
-/// nil — only two tile sizes (1 and 4), one group size, one krot and one
-/// dtype are ever requested per model, so the lock is contended a handful of
-/// times per process before steady-state hits.
-nonisolated(unsafe) private var kernelCache: [RotationKernelKey: MLXFast.MLXFastKernel] = [:]
-private let kernelCacheLock = NSLock()
-
-/// Sole entry point is `dispatchPairwiseRotation`, which owns the geometry
-/// checks. groupSize == 128 compiles the simdgroup-resident kernel, any
-/// other group size the generic one; both are specialised on the full key.
-nonisolated private func getRotationKernel(
-    tile: Int, groupSize: Int, krot: Int, dtype: DType
-) -> MLXFast.MLXFastKernel {
-    kernelCacheLock.withLock {
-        let key = RotationKernelKey(tile: tile, groupSize: groupSize, krot: krot, dtype: dtype)
-        if let cached = kernelCache[key] {
-            return cached
-        }
-        guard let (t, t4) = rotationKernelTypeNames(dtype) else {
-            preconditionFailure(
-                "PairwiseRotation: unsupported activation dtype \(dtype) (expected float16/bfloat16/float32)"
-            )
-        }
-        let source: String
-        let name: String
-        if groupSize == 128 {
-            name = "paro_rotate_r\(tile)_k\(krot)_\(t)"
-            source = simdgroupMetalSource(
-                rowsPerTile: tile, krot: krot, elementType: t, elementType4: t4)
-        } else {
-            name = "paro_rotate_generic_r\(tile)_g\(groupSize)_k\(krot)_\(t)"
-            source = genericMetalSource(
-                rowsPerTile: tile, groupSize: groupSize, krot: krot, elementType: t)
-        }
-        let kernel = MLXFast.metalKernel(
-            name: name,
-            inputNames: [
-                "x", "packed_pairs", "cos_theta", "sin_theta", "channel_scales", "params",
-            ],
-            outputNames: ["out"],
-            source: source
-        )
-        kernelCache[key] = kernel
-        return kernel
-    }
-}
-
-// MARK: - Generic Fallback Kernel (groupSize != 128)
-
-/// Pre-simdgroup rotation kernel, kept as the fallback for groupSize != 128:
-/// one thread per pair slot (`tid < GROUP_SIZE / 2`), a full CTA barrier per
-/// round, and a channel-major threadgroup tile. Group size, krot and the
-/// element type are compile-time constants, so the tile and the per-lane
-/// coefficient arrays are sized exactly for the model instead of against a
-/// fixed ceiling, and the write-back casts explicitly like the simdgroup
-/// kernel. Any even groupSize whose half fits one threadgroup (<= 2048)
-/// works; the loader and `dispatchPairwiseRotation` enforce the geometry.
-private func genericMetalSource(
-    rowsPerTile: Int, groupSize: Int, krot: Int, elementType t: String
-) -> String {
-    """
-    constexpr int ROWS_PER_TILE = \(rowsPerTile);
-    constexpr int GROUP_SIZE    = \(groupSize);
-    constexpr int KROT          = \(krot);
-
-    const int batch_size  = params[0];
-    const int hidden_size = params[1];
+/// Generic rotation kernel for any other group size: one thread per pair
+/// slot (`GROUP_SIZE / 2` per CTA), a full CTA barrier per round, and a
+/// channel-major threadgroup tile. Same per-element math as the simdgroup
+/// kernel.
+private let genericRotationSource = """
+    // `x_shape` is MLX's auto-injected shape buffer for input `x` ([batch, dim]).
+    const int batch_size  = x_shape[0];
+    const int hidden_size = x_shape[1];
 
     const int half_gs     = GROUP_SIZE / 2;
     const int half_hidden = hidden_size / 2;
@@ -270,26 +184,44 @@ private func genericMetalSource(
     for (int r = 0; r < ROWS_PER_TILE; r++) {
         int row = tile_idx * ROWS_PER_TILE + r;
         if (row < batch_size) {
-            out[row * hidden_size + ch_lo] = \(t)(tile[tid * ROWS_PER_TILE + r]);
-            out[row * hidden_size + ch_hi] = \(t)(tile[(tid + half_gs) * ROWS_PER_TILE + r]);
+            out[row * hidden_size + ch_lo] = T(tile[tid * ROWS_PER_TILE + r]);
+            out[row * hidden_size + ch_hi] = T(tile[(tid + half_gs) * ROWS_PER_TILE + r]);
         }
     }
     """
+
+/// The two rotation kernels, compiled once per process; MLX memoizes each
+/// template instantiation behind them.
+private final class RotationKernels: Sendable {
+    static let shared = RotationKernels()
+    let simdgroup: MLXFast.MLXFastKernel
+    let generic: MLXFast.MLXFastKernel
+
+    private init() {
+        let inputNames = ["x", "packed_pairs", "cos_theta", "sin_theta", "channel_scales"]
+        simdgroup = MLXFast.metalKernel(
+            name: "paro_rotate", inputNames: inputNames, outputNames: ["out"],
+            source: simdgroupRotationSource)
+        generic = MLXFast.metalKernel(
+            name: "paro_rotate_generic", inputNames: inputNames, outputNames: ["out"],
+            source: genericRotationSource)
+    }
 }
 
 // MARK: - Geometry
 
-/// The largest half-group the generic kernel can run: one thread per pair
-/// slot in a single threadgroup (Metal's 1024-thread CTA limit).
-private let maxGenericGroupSize = 2048
+/// Largest group size the generic kernel accepts. One thread per pair slot
+/// (Metal's 1024-thread CTA ceiling) and a 4-row f32 tile within the 32 KB
+/// threadgroup-memory ceiling both allow 2048; 1024 keeps either bound at
+/// half headroom.
+private let maxGenericGroupSize = 1024
 
-/// Validate a rotation's (dims, groupSize, krot) triple. The kernels assume
-/// every one of these: `dims` splits into whole groups (a trailing partial
-/// group would silently go un-rotated — `numGroups` floors), a group holds
-/// whole pairs, its half fits one threadgroup, and there is at least one
-/// round. Returns a reason on failure so the loader can surface it as a
-/// typed error before any module is built; the module initializers assert
-/// the same contract for direct callers.
+/// Validate a rotation's (dims, groupSize, krot) triple against what the
+/// kernels assume, returning a reason on failure. The one silent case worth
+/// naming: a `dims` that is not a whole number of groups would leave the
+/// trailing partial group un-rotated (`numGroups` floors). The loader
+/// surfaces a failure as a typed error with the key path; the module
+/// initializers assert it for direct callers.
 nonisolated func rotationGeometryProblem(dims: Int, groupSize: Int, krot: Int) -> String? {
     if krot < 1 {
         return "krot must be >= 1 (got \(krot))"
@@ -307,10 +239,10 @@ nonisolated func rotationGeometryProblem(dims: Int, groupSize: Int, krot: Int) -
     return nil
 }
 
-/// `precondition` form of `rotationGeometryProblem` for the module initializers.
+/// `precondition` form of `rotationGeometryProblem`.
 nonisolated func assertRotationGeometry(dims: Int, groupSize: Int, krot: Int) {
     if let problem = rotationGeometryProblem(dims: dims, groupSize: groupSize, krot: krot) {
-        preconditionFailure("PairwiseRotation: \(problem)")
+        preconditionFailure("Pairwise rotation: \(problem)")
     }
 }
 
@@ -319,10 +251,10 @@ nonisolated func assertRotationGeometry(dims: Int, groupSize: Int, krot: Int) {
 /// Dispatch the pairwise rotation on a 2-D `[batch, dim]` activation.
 ///
 /// groupSize == 128 takes the simdgroup-resident kernel (2 pair slots per
-/// lane, no CTA rendezvous); any other groupSize the generic kernel, which is
-/// specialised on the group size. Both kernels are instantiated for
-/// float16, bfloat16 and float32 activations. Shared by `PairwiseRotation`
-/// and `RotateQuantizedLinear`.
+/// lane, no CTA rendezvous); any other groupSize the generic kernel. Both
+/// instantiate for float16, bfloat16 and float32 activations. Shared by
+/// `PairwiseRotation` and `RotateQuantizedLinear`, whose initializers have
+/// already validated the geometry.
 ///
 /// Zero-row inputs pass straight through: gathered MoE activations can be
 /// legitimately empty, and a zero-sized grid dispatch is undefined. The
@@ -332,19 +264,28 @@ nonisolated func dispatchPairwiseRotation(
 ) -> MLXArray {
     let batch = flat.dim(0)
     if batch == 0 { return flat }
+    precondition(
+        flat.dtype == .float16 || flat.dtype == .bfloat16 || flat.dtype == .float32,
+        "Pairwise rotation: unsupported activation dtype \(flat.dtype)")
 
     let dim = state.scalesFlat.dim(0)
-    assertRotationGeometry(dims: dim, groupSize: groupSize, krot: krot)
     let numGroups = dim / groupSize
     let tile = batch <= 1 ? 1 : 4
-    let params = MLXArray([Int32(batch), Int32(dim), Int32(krot), Int32(groupSize)])
 
-    let kernel = getRotationKernel(tile: tile, groupSize: groupSize, krot: krot, dtype: flat.dtype)
-    let threads = groupSize == 128 ? 32 : groupSize / 2
+    let kernels = RotationKernels.shared
+    let (kernel, threads) =
+        groupSize == 128 ? (kernels.simdgroup, 32) : (kernels.generic, groupSize / 2)
+    var template: [(String, any KernelTemplateArg)] = [
+        ("T", flat.dtype), ("ROWS_PER_TILE", tile), ("KROT", krot),
+    ]
+    if groupSize != 128 {
+        template.append(("GROUP_SIZE", groupSize))
+    }
 
     let gridX = ((batch + tile - 1) / tile) * threads
     return kernel(
-        [flat, state.packedPairs, state.cosTheta, state.sinTheta, state.scalesFlat, params],
+        [flat, state.packedPairs, state.cosTheta, state.sinTheta, state.scalesFlat],
+        template: template,
         grid: (gridX, numGroups, 1),
         threadGroup: (threads, 1, 1),
         outputShapes: [flat.shape],
@@ -511,9 +452,7 @@ public class PairwiseRotation: Module, RotationStatePreparing {
     /// unchanged (guarded in `dispatchPairwiseRotation`). No mutable state
     /// is read or written by this method.
     ///
-    /// Kernel selection lives in `dispatchPairwiseRotation`: groupSize == 128
-    /// takes the simdgroup-resident kernel, any other group size the generic
-    /// fallback specialised on that size.
+    /// Kernel selection lives in `dispatchPairwiseRotation`.
     public func rotate(_ x: MLXArray) -> MLXArray {
         let shape = x.shape
         return dispatchPairwiseRotation(

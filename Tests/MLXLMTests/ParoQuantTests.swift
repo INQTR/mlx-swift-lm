@@ -109,58 +109,59 @@ public class ParoQuantTests: XCTestCase {
     /// The converter must handle **every** `.qweight` prefix — MoE per-expert
     /// weights carry no sibling `theta` (their rotations are shared per layer)
     /// and were silently skipped by the old theta-filter — and must emit
-    /// scales and biases in the checkpoint's own float dtype (read from the
-    /// rotation tensors), so `quantizedMM` never promotes a bf16 activation
-    /// stream to f32 against f16 scales.
-    func testAWQConversionCoversThetaLessPrefixesAndMatchesCheckpointDType() {
-        for floatDType in [DType.float16, DType.bfloat16] {
-            // AWQ layout for in=8, out=8, groupSize=8:
-            //   qweight [in, out/8] int32, qzeros [in/gs, out/8] int32, scales [in/gs, out] f32
-            let dense = "model.layers.0.mlp.gate_proj."
-            let expert = "model.layers.0.mlp.experts.0.gate_proj."
-
-            var weights: [String: MLXArray] = [:]
-            for pfx in [dense, expert] {
-                weights["\(pfx)qweight"] = MLXArray(
-                    Array(repeating: UInt32(0x7654_3210), count: 8)
-                ).reshaped(8, 1)
-                weights["\(pfx)qzeros"] = MLXArray([UInt32(0x3333_3333)]).reshaped(1, 1)
-                weights["\(pfx)scales"] = MLXArray((0 ..< 8).map { Float($0) + 1.0 }).reshaped(1, 8)
-            }
-            // Only the dense prefix has rotation params, as in real MoE checkpoints;
-            // their dtype is the checkpoint's float dtype.
-            weights["\(dense)theta"] = MLXArray.zeros([2, 4]).asType(floatDType)
-
-            convertAutoAWQ(&weights, groupSize: 8)
-
-            for pfx in [dense, expert] {
-                XCTAssertNil(weights["\(pfx)qweight"], "\(pfx): qweight not consumed")
-                XCTAssertNil(weights["\(pfx)qzeros"], "\(pfx): qzeros not consumed")
-                let weight = try? XCTUnwrap(
-                    weights["\(pfx)weight"], "\(pfx): missing converted weight")
-                XCTAssertEqual(weight?.dtype, .uint32)
-                let scales = try? XCTUnwrap(weights["\(pfx)scales"], "\(pfx): missing scales")
-                XCTAssertEqual(
-                    scales?.dtype, floatDType, "\(pfx): scales not cast to \(floatDType)")
-                XCTAssertEqual(scales?.shape, [8, 1], "\(pfx): scales not transposed")
-                XCTAssertEqual(
-                    weights["\(pfx)biases"]?.dtype, floatDType,
-                    "\(pfx): biases not cast to \(floatDType)")
-            }
-            XCTAssertNotNil(weights["\(dense)theta"], "theta must pass through untouched")
-        }
+    /// scales and biases in the requested float dtype, so `quantizedMM` never
+    /// promotes a bf16 activation stream to f32 against f16 scales.
+    func testAWQConversionCoversThetaLessPrefixesAndCastsToFloatDType() {
+        assertAWQConversion(floatDType: .float16)
+        assertAWQConversion(floatDType: .bfloat16)
     }
 
-    /// Without any rotation tensor to read the dtype from, conversion keeps
-    /// the historical float16 default.
-    func testCheckpointFloatDTypeDefaultsToFloat16() {
-        XCTAssertEqual(checkpointFloatDType([:]), .float16)
+    private func assertAWQConversion(floatDType: DType) {
+        // AWQ layout for in=8, out=8, groupSize=8:
+        //   qweight [in, out/8] int32, qzeros [in/gs, out/8] int32, scales [in/gs, out] f32
+        let dense = "model.layers.0.mlp.gate_proj."
+        let expert = "model.layers.0.mlp.experts.0.gate_proj."
+
+        var weights: [String: MLXArray] = [:]
+        for pfx in [dense, expert] {
+            weights["\(pfx)qweight"] = MLXArray(Array(repeating: UInt32(0x7654_3210), count: 8))
+                .reshaped(8, 1)
+            weights["\(pfx)qzeros"] = MLXArray([UInt32(0x3333_3333)]).reshaped(1, 1)
+            weights["\(pfx)scales"] = MLXArray((0 ..< 8).map { Float($0) + 1.0 }).reshaped(1, 8)
+        }
+        // Only the dense prefix has rotation params, as in real MoE checkpoints.
+        weights["\(dense)theta"] = MLXArray.zeros([2, 4])
+
+        convertAutoAWQ(&weights, groupSize: 8, floatDType: floatDType)
+
+        for pfx in [dense, expert] {
+            XCTAssertNil(weights["\(pfx)qweight"], "\(pfx): qweight not consumed")
+            XCTAssertNil(weights["\(pfx)qzeros"], "\(pfx): qzeros not consumed")
+            let weight = try? XCTUnwrap(weights["\(pfx)weight"], "\(pfx): missing converted weight")
+            XCTAssertEqual(weight?.dtype, .uint32)
+            let scales = try? XCTUnwrap(weights["\(pfx)scales"], "\(pfx): missing scales")
+            XCTAssertEqual(scales?.dtype, floatDType, "\(pfx): scales not cast to \(floatDType)")
+            XCTAssertEqual(scales?.shape, [8, 1], "\(pfx): scales not transposed")
+            XCTAssertEqual(
+                weights["\(pfx)biases"]?.dtype, floatDType,
+                "\(pfx): biases not cast to \(floatDType)")
+        }
+        XCTAssertNotNil(weights["\(dense)theta"], "theta must pass through untouched")
+    }
+
+    /// The checkpoint float dtype comes from its rotation tensors (theta
+    /// first, then channel_scales), deterministically, and is nil when
+    /// neither exists.
+    func testCheckpointFloatDTypeReadsRotationTensors() {
+        XCTAssertNil(checkpointFloatDType([:]))
         XCTAssertEqual(
             checkpointFloatDType(["a.channel_scales": MLXArray.ones([1, 4]).asType(.bfloat16)]),
             .bfloat16)
-        // Non-float rotation tensors (pairs) never decide the dtype.
         XCTAssertEqual(
-            checkpointFloatDType(["a.pairs": MLXArray.zeros([1, 4], type: Int16.self)]), .float16)
+            checkpointFloatDType([
+                "b.theta": MLXArray.zeros([1, 2]).asType(.float16),
+                "a.channel_scales": MLXArray.ones([1, 4]).asType(.bfloat16),
+            ]), .float16, "theta wins over channel_scales")
     }
 
     func testAWQUnpackReorderPackRoundTrip() {
@@ -288,6 +289,12 @@ public class ParoQuantTests: XCTestCase {
             inputDims: 64, hiddenDims: 64, numExperts: 8, groupSize: 32, krot: 2)
         quantize(model: glu, groupSize: 32, bits: 4)
         XCTAssertTrue(glu.trainableParameters().flattened().isEmpty)
+
+        // The dense carrier builds through the array-passing QuantizedLinear
+        // initializer, which does not freeze on its own.
+        let linear = RotateQuantizedLinear(
+            inputDims: 16, outputDims: 8, hasBias: true, groupSize: 8, bits: 4, krot: 2)
+        XCTAssertTrue(linear.trainableParameters().flattened().isEmpty)
     }
 
     /// The geometry every kernel assumes, rejected up front with a reason:
@@ -296,11 +303,11 @@ public class ParoQuantTests: XCTestCase {
     func testRotationGeometryProblems() {
         XCTAssertNil(rotationGeometryProblem(dims: 256, groupSize: 128, krot: 8))
         XCTAssertNil(rotationGeometryProblem(dims: 16, groupSize: 8, krot: 1))
-        XCTAssertNil(rotationGeometryProblem(dims: 4096, groupSize: 2048, krot: 3))
+        XCTAssertNil(rotationGeometryProblem(dims: 2048, groupSize: 1024, krot: 3))
         XCTAssertNotNil(rotationGeometryProblem(dims: 20, groupSize: 8, krot: 2), "partial group")
         XCTAssertNotNil(rotationGeometryProblem(dims: 18, groupSize: 9, krot: 2), "odd group")
         XCTAssertNotNil(rotationGeometryProblem(dims: 8, groupSize: 16, krot: 2), "dims < group")
-        XCTAssertNotNil(rotationGeometryProblem(dims: 8192, groupSize: 4096, krot: 2), "CTA limit")
+        XCTAssertNotNil(rotationGeometryProblem(dims: 4096, groupSize: 2048, krot: 2), "CTA limit")
         XCTAssertNotNil(rotationGeometryProblem(dims: 16, groupSize: 8, krot: 0), "no rounds")
     }
 
@@ -324,42 +331,35 @@ public class ParoQuantTests: XCTestCase {
     /// dtype the kernels are instantiated for.
     func testPairwiseRotationMatchesCPUReference() throws {
         let krot = 3
+        // bfloat16 keeps 8 significand bits, so it rounds ~8x coarser than
+        // float16 on the same values.
+        let cases: [(dtype: DType, tolerance: Float, batch: Int)] = [
+            (.float16, 0.01, 1), (.float16, 0.01, 5),
+            (.bfloat16, 0.05, 1), (.bfloat16, 0.05, 5),
+            (.float32, 0.001, 1), (.float32, 0.001, 5),
+        ]
         for groupSize in [8, 128] {
             let dim = groupSize * 2
-
             let rot = PairwiseRotation(dims: dim, groupSize: groupSize, krot: krot)
-            let theta = (MLXRandom.normal([krot, dim / 2]) * 0.5).asType(.float16)
-            let pairs = makeRandomPairs(krot: krot, dim: dim, groupSize: groupSize)
-            let channelScales = (MLXRandom.normal([1, dim]) * 0.1 + 1.0).asType(.float16)
-            try rot.update(
-                parameters: ModuleParameters.unflattened([
-                    "theta": theta, "pairs": pairs, "channel_scales": channelScales,
-                ]),
-                verify: [.all])
+            let params = makeRotationParameters(dims: dim, groupSize: groupSize, krot: krot)
+            try rot.update(parameters: ModuleParameters.unflattened(params), verify: [.all])
             rot.prepareDerivedRotationState()
 
-            // bfloat16 keeps 8 significand bits, so it rounds ~8x coarser than
-            // float16 on the same values.
-            let tolerances: [(DType, Float)] = [
-                (.float16, 0.01), (.bfloat16, 0.05), (.float32, 0.001),
-            ]
-            for (dtype, tolerance) in tolerances {
-                for batch in [1, 5] {
-                    let x = MLXRandom.normal([batch, dim]).asType(dtype)
-                    eval(x)
+            for c in cases {
+                let x = MLXRandom.normal([c.batch, dim]).asType(c.dtype)
+                eval(x)
 
-                    let expected = referenceRotate(
-                        x: x, pairs: pairs, theta: theta, channelScales: channelScales,
-                        groupSize: groupSize)
-                    let y = rot.rotate(x)
-                    XCTAssertEqual(y.dtype, dtype)
+                let expected = referenceRotate(
+                    x: x, pairs: params["pairs"]!, theta: params["theta"]!,
+                    channelScales: params["channel_scales"]!, groupSize: groupSize)
+                let y = rot.rotate(x)
+                XCTAssertEqual(y.dtype, c.dtype)
 
-                    let relError = relativeRMSError(expected, y)
-                    XCTAssertLessThan(
-                        relError, tolerance,
-                        "groupSize \(groupSize) \(dtype) batch \(batch): kernel diverges from CPU reference"
-                    )
-                }
+                let relError = relativeRMSError(expected, y)
+                XCTAssertLessThan(
+                    relError, c.tolerance,
+                    "groupSize \(groupSize) \(c.dtype) batch \(c.batch): kernel diverges from CPU reference"
+                )
             }
         }
     }
@@ -592,12 +592,10 @@ public class ParoQuantTests: XCTestCase {
             weights["switch_mlp.\(proj).biases"] = biases ?? MLXArray.zeros(scales.shape)
         }
         for (child, dims) in [("gate_up_rot", inputDims), ("down_rot", hiddenDims)] {
-            weights["switch_mlp.\(child).theta"] =
-                (MLXRandom.normal([krot, dims / 2]) * 0.1).asType(.float16)
-            weights["switch_mlp.\(child).pairs"] = makeRandomPairs(
-                krot: krot, dim: dims, groupSize: groupSize)
-            weights["switch_mlp.\(child).channel_scales"] =
-                (MLXRandom.normal([1, dims]) * 0.1 + 1.0).asType(.float16)
+            for (key, value) in makeRotationParameters(dims: dims, groupSize: groupSize, krot: krot)
+            {
+                weights["switch_mlp.\(child).\(key)"] = value
+            }
         }
 
         // Mirror the loader: GLU swap → quantize by checkpoint keys → strict
@@ -822,6 +820,16 @@ private func makeTestLayer(hasBias: Bool) throws -> RotateQuantizedLinear {
     layer.prepareDerivedRotationState()
     eval(layer)
     return layer
+}
+
+/// Random rotation parameters under their checkpoint keys: small angles,
+/// a permutation per group per round, and near-unit channel scales.
+private func makeRotationParameters(dims: Int, groupSize: Int, krot: Int) -> [String: MLXArray] {
+    [
+        "theta": (MLXRandom.normal([krot, dims / 2]) * 0.5).asType(.float16),
+        "pairs": makeRandomPairs(krot: krot, dim: dims, groupSize: groupSize),
+        "channel_scales": (MLXRandom.normal([1, dims]) * 0.1 + 1.0).asType(.float16),
+    ]
 }
 
 /// Generates random permutation pair indices for Givens rotations within each group.

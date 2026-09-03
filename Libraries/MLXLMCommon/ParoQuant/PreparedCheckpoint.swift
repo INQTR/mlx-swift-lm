@@ -45,7 +45,10 @@ public enum ParoQuantPreparedCheckpoint {
     /// Bump whenever conversion semantics change — `convertAutoAWQ`, the
     /// Mamba projection split, MoE expert stacking, or the rotation-key
     /// remap. A bump invalidates every existing artifact on next load.
-    static let formatVersion = 1
+    ///
+    /// 2: `convertAutoAWQ` casts scales/biases to the checkpoint's float dtype
+    ///    instead of float16 (byte-identical for f16 checkpoints).
+    static let formatVersion = 2
 
     /// Safetensors metadata key holding the JSON-encoded ``Manifest``.
     static let manifestKey = "paroquant.prepared_checkpoint.manifest"
