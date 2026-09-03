@@ -61,7 +61,31 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
+        // Exact-revision pin on the spokvulcan/mlx-swift fork, branch
+        // pin-tesseract: 24779d5 = 362e41e (lineage: ml-explore 0.31.6 +
+        // provenance + C-series gitlink bumps + qmv_wide backport (mlx#3764)
+        // + affine_qmm_mma8 + SDPA qL-tiling/direct-fragment mma8 + the
+        // multi-query SDPA vector kernel) + dynamicSliceUpdated wrapper and
+        // the round-5 mlx gitlink b2fcc671: mma8n16 QMM tile, masked/padded
+        // mma SDPA, MLX_DYNSLICE_INPLACE, MLX_MAX_ACTIVE_TASKS,
+        // MLX_OP_CENSUS (tesseract ledger R29-R49).
+        //
+        // mlx-core stays at v0.31.1 here. The branch
+        // pin-tesseract-2026-07-27 (mlx-swift 708a5142 / mlx e9d788fe) carries
+        // a working port to upstream mlx main, but mlx >= v0.32 makes command
+        // encoders thread-local and mlx-c exposes no
+        // new_thread_unsafe_stream binding, so a process-wide Stream used
+        // across Swift-concurrency threads throws "There is no Stream(gpu, 0)
+        // in current thread". See tesseract docs/mlx-core-fork.md.
+        //
+        // The pin must match the tesseract app's other vendored packages
+        // (mlx-audio-swift, tesseract-speech) exactly — SwiftPM cannot mix two
+        // different revision-based requirements for the same package in one
+        // graph, so every pin moves in lockstep. Scheme: tesseract
+        // docs/mlx-core-fork.md.
+        .package(
+            url: "https://github.com/spokvulcan/mlx-swift",
+            revision: "24779d5cf68ef0038ddd32caf6e1bd880d104e83"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
