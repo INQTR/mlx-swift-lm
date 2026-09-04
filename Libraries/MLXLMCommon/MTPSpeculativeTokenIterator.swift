@@ -694,7 +694,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 }
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
-    mutating func finalizeGeneration() {
+    public mutating func finalizeGeneration() {
         // A fully consumed all-accepted round can still retain the recurrent
         // checkpoint used for early-finalization rollback. Release it even
         // when no committed lookahead remains.
