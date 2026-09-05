@@ -62,13 +62,18 @@ let package = Package(
     ],
     dependencies: [
         // Exact-revision pin on the spokvulcan/mlx-swift fork, branch
-        // pin-tesseract: 24779d5 = 362e41e (lineage: ml-explore 0.31.6 +
+        // pin-tesseract: 6058402 = 24779d5 (lineage: ml-explore 0.31.6 +
         // provenance + C-series gitlink bumps + qmv_wide backport (mlx#3764)
         // + affine_qmm_mma8 + SDPA qL-tiling/direct-fragment mma8 + the
-        // multi-query SDPA vector kernel) + dynamicSliceUpdated wrapper and
-        // the round-5 mlx gitlink b2fcc671: mma8n16 QMM tile, masked/padded
+        // multi-query SDPA vector kernel + dynamicSliceUpdated wrapper + the
+        // round-5 mlx gitlink b2fcc671: mma8n16 QMM tile, masked/padded
         // mma SDPA, MLX_DYNSLICE_INPLACE, MLX_MAX_ACTIVE_TASKS,
-        // MLX_OP_CENSUS (tesseract ledger R29-R49).
+        // MLX_OP_CENSUS, tesseract ledger R29-R49) + the dynamicSlice op
+        // and the mlx gitlink b6a5f3b6 (2026-09-05 loop): small-M 4-bit QMM
+        // tile diet, full-tile variant and v2 scale-after-accumulate
+        // default, 1-pass SDPA for any qL <= 8, 32/64 partitions for the
+        // 2-pass MMA kernel, fast-math compile for custom kernels named
+        // fastmath_*, MLX_KERNEL_PROFILE / MLX_CB_PROFILE probes.
         //
         // mlx-core stays at v0.31.1 here. The branch
         // pin-tesseract-2026-07-27 (mlx-swift 708a5142 / mlx e9d788fe) carries
@@ -85,7 +90,7 @@ let package = Package(
         // docs/mlx-core-fork.md.
         .package(
             url: "https://github.com/spokvulcan/mlx-swift",
-            revision: "24779d5cf68ef0038ddd32caf6e1bd880d104e83"),
+            revision: "6058402c676de25560051acda772e80d86d696d1"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
