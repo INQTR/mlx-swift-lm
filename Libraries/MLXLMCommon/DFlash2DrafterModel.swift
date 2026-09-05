@@ -166,76 +166,92 @@ public protocol DFlash2TargetModel: LanguageModel {
 public struct GatedDeltaCapture {
     /// `concat([convState, qkv])`: the conv input, `[1, K - 1 + S, convDim]`.
     public var convInput: MLXArray
-    /// Post-norm, post-scale `q`/`k` (`[1, S, Hk, Dk]`) and `v` (`[1, S, Hv, Dv]`).
-    public var q: MLXArray
+    /// Post-norm, post-scale `k` (`[1, S, Hk, Dk]`) and `v` (`[1, S, Hv, Dv]`).
     public var k: MLXArray
     public var v: MLXArray
-    /// Raw gate projections, `[1, S, Hv]`.
-    public var a: MLXArray
-    public var b: MLXArray
-    public var aLog: MLXArray
-    public var dtBias: MLXArray
+    /// The scan's gates: precomputed `[1, S, Hv]` f32 `g`/`beta`, or the
+    /// pre-activation source the kernel reads them from (see ``GatedDeltaGates``).
+    public var gates: GatedDeltaGates
     /// Recurrent state before the pass.
     public var initialState: MLXArray
 
     public init(
-        convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray,
-        a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+        convInput: MLXArray, k: MLXArray, v: MLXArray, gates: GatedDeltaGates,
         initialState: MLXArray
     ) {
         self.convInput = convInput
-        self.q = q
         self.k = k
         self.v = v
-        self.a = a
-        self.b = b
-        self.aLog = aLog
-        self.dtBias = dtBias
+        self.gates = gates
         self.initialState = initialState
     }
 
-    /// The capture's per-pass arrays, in ``init(arrays:aLog:dtBias:initialState:)``
-    /// order, so a compiled verify body can return them as outputs.
-    package var arrays: [MLXArray] { [convInput, q, k, v, a, b] }
-
-    package init(arrays: [MLXArray], aLog: MLXArray, dtBias: MLXArray, initialState: MLXArray) {
-        precondition(arrays.count == 6, "convInput, q, k, v, a, b")
+    public init(
+        convInput: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray,
+        initialState: MLXArray
+    ) {
         self.init(
-            convInput: arrays[0], q: arrays[1], k: arrays[2], v: arrays[3], a: arrays[4],
-            b: arrays[5], aLog: aLog, dtBias: dtBias, initialState: initialState)
+            convInput: convInput, k: k, v: v, gates: .precomputed(g: g, beta: beta),
+            initialState: initialState)
+    }
+
+    /// The capture's per-pass arrays, in ``init(arrays:initialState:)``
+    /// order, so a compiled verify body can return them as outputs: the
+    /// conv input, `k`, `v`, then `g`/`beta` or the two gate source arrays.
+    package var arrays: [MLXArray] {
+        switch gates {
+        case .precomputed(let g, let beta): [convInput, k, v, g, beta]
+        case .source(let source): [convInput, k, v, source.aSource, source.bSource]
+        }
+    }
+    package static let arrayCount = 5
+
+    /// The layer-side half of a gate source: what `init(arrays:initialState:layout:)`
+    /// adds back to the two source arrays a trace returned.
+    public struct GateLayout {
+        public var aOffset: Int
+        public var bOffset: Int
+        public var aLog: MLXArray
+        public var dtBias: MLXArray
+
+        public init(aOffset: Int, bOffset: Int, aLog: MLXArray, dtBias: MLXArray) {
+            self.aOffset = aOffset
+            self.bOffset = bOffset
+            self.aLog = aLog
+            self.dtBias = dtBias
+        }
+    }
+
+    package init(arrays: [MLXArray], initialState: MLXArray, layout: GateLayout? = nil) {
+        precondition(arrays.count == Self.arrayCount, "convInput, k, v, gates")
+        let gates: GatedDeltaGates =
+            if let layout {
+                .source(
+                    GatedDeltaGateSource(
+                        aSource: arrays[3], aOffset: layout.aOffset, bSource: arrays[4],
+                        bOffset: layout.bOffset, aLog: layout.aLog, dtBias: layout.dtBias))
+            } else {
+                .precomputed(g: arrays[3], beta: arrays[4])
+            }
+        self.init(
+            convInput: arrays[0], k: arrays[1], v: arrays[2], gates: gates,
+            initialState: initialState)
     }
 
     /// The layer's state after the first `validCount` positions of the pass.
     ///
-    /// Replays every position with the steps past `validCount` masked out.
-    /// A masked step leaves the scan state untouched, so the result equals
+    /// Replays every position with the steps past `validCount` skipped.
+    /// A skipped step leaves the scan state untouched, so the result equals
     /// the accepted-prefix replay for every count, and `validCount` may be a
-    /// lazy `[]` int32 array. Returns the recurrent and conv states.
+    /// lazy `[]` int32 array. The conv state is the `K - 1` rows of the conv
+    /// input from `validCount` on, copied by the same launch. Returns the
+    /// recurrent and conv states.
     public func replay(validCount: MLXArray) -> (recurrent: MLXArray, conv: MLXArray) {
-        let outputs = compiledGatedDeltaReplay([
-            q, k, v, a, b, aLog, dtBias, initialState, convInput, validCount,
-        ])
-        return (outputs[0], outputs[1])
+        let replayed = gatedDeltaStateAfter(
+            validCount: validCount, k: k, v: v, gates: gates, state: initialState,
+            convInput: convInput)
+        return (replayed.state, replayed.conv)
     }
-}
-
-/// One trace serves every layer: shapes match across a model's gated-delta
-/// layers, and the elementwise work around the scan fuses into a few launches.
-private let compiledGatedDeltaReplay: @Sendable ([MLXArray]) -> [MLXArray] = compile { inputs in
-    let (q, k, v) = (inputs[0], inputs[1], inputs[2])
-    let (a, b, aLog, dtBias) = (inputs[3], inputs[4], inputs[5], inputs[6])
-    let (state, convInput, validCount) = (inputs[7], inputs[8], inputs[9])
-    let s = q.dim(1)
-    let mask = (MLXArray(Int32(0) ..< Int32(s)) .< validCount.asType(.int32))
-        .expandedDimensions(axis: 0)
-    let (_, newState) = gatedDeltaUpdate(
-        q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias, state: state, mask: mask)
-    // Conv state after `validCount` positions: rows [validCount, validCount + K - 1).
-    let kernelRows = convInput.dim(1) - s
-    let rows = (validCount.asType(.int32) + MLXArray(Int32(0) ..< Int32(kernelRows)))
-        .reshaped([1, kernelRows, 1])
-    let conv = contiguous(takeAlong(convInput, rows, axis: 1))
-    return [newState, conv]
 }
 
 // MARK: - Attention cache rows

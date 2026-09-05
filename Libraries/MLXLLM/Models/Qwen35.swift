@@ -168,6 +168,26 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// Holder for the q/k scale scalars; a plain class so the module's
+/// parameter walk ignores it.
+private final class QKScaleCache {
+    var scales: (dtype: DType, q: MLXArray, k: MLXArray, pair: MLXArray)?
+}
+
+/// Holder for the attention's folded query norm weight; a plain class so
+/// the module's parameter walk ignores it.
+private final class FoldedQueryScaleCache {
+    var weight: MLXArray?
+}
+
+/// Where the GDN output gate `z` lives: `array[..., offset ..< offset + valueDim]`
+/// of a `[B, S, rowLength]` projection row.
+struct GateSource {
+    let array: MLXArray
+    let offset: Int
+    let rowLength: Int
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -300,30 +320,66 @@ final class Qwen35GatedDeltaNet: Module {
         }
     }
 
+    /// Column offsets of `b` and `a` in the fused projection row.
+    private var fusedGateOffsets: (b: Int, a: Int) {
+        let zEnd = keyDim * 2 + valueDim * 2
+        return (zEnd, zEnd + numVHeads)
+    }
+
+    /// The scan's gate source: the `b`/`a` columns of the fused projection
+    /// row, or the standalone projections when the row is not fused.
+    private var usesFusedProjection: Bool {
+        fusedInputProjectionEnabled && fusedInputProjection.fused != nil
+    }
+
+    /// What rebuilds a capture's gate source from the two arrays a compiled
+    /// verify body returned: the offsets and the layer's `A_log`/`dt_bias`.
+    var captureGateLayout: GatedDeltaCapture.GateLayout {
+        let offsets = usesFusedProjection ? fusedGateOffsets : (b: 0, a: 0)
+        return .init(aOffset: offsets.a, bOffset: offsets.b, aLog: aLog, dtBias: dtBias)
+    }
+
     func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
-        qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+        qkv: MLXArray, z: MLXArray, gates: GatedDeltaGateSource, zSource: GateSource,
+        qkvSource: GateSource
     ) {
         guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+            let z = inProjZ(inputs)
+            let qkv = inProjQKV(inputs)
             return (
-                inProjQKV(inputs),
-                inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
-                inProjB(inputs),
-                inProjA(inputs)
+                qkv,
+                z.reshaped(batch, sequence, numVHeads, headVDim),
+                GatedDeltaGateSource(
+                    a: inProjA(inputs), b: inProjB(inputs), aLog: aLog, dtBias: dtBias),
+                GateSource(array: z, offset: 0, rowLength: valueDim),
+                GateSource(array: qkv, offset: 0, rowLength: convDim)
             )
         }
 
         let projected = fusedInProj(inputs)
         let qkvEnd = keyDim * 2 + valueDim
         let zEnd = qkvEnd + valueDim
-        let bEnd = zEnd + numVHeads
-        let aEnd = bEnd + numVHeads
+        let offsets = fusedGateOffsets
+        let aEnd = offsets.a + numVHeads
         return (
             projected[0..., 0..., ..<qkvEnd],
             projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
                 batch, sequence, numVHeads, headVDim),
-            projected[0..., 0..., zEnd ..< bEnd],
-            projected[0..., 0..., bEnd ..< aEnd]
+            GatedDeltaGateSource(
+                aSource: projected, aOffset: offsets.a, bSource: projected, bOffset: offsets.b,
+                aLog: aLog, dtBias: dtBias),
+            GateSource(array: projected, offset: qkvEnd, rowLength: aEnd),
+            GateSource(array: projected, offset: 0, rowLength: aEnd)
         )
+    }
+
+    /// The gated output norm as one launch, reading the gate out of its
+    /// projection row; nil when the kernel does not cover the shape.
+    private func fusedNormGate(_ out: MLXArray, gate: GateSource) -> MLXArray? {
+        guard out.dtype == .bfloat16, headVDim == 128 else { return nil }
+        return gatedDeltaNormGate(
+            out, gateSource: gate.array, gateOffset: gate.offset,
+            gateRowLength: gate.rowLength, weight: norm.weight, eps: norm.eps)
     }
 
     func callAsFunction(
@@ -378,26 +434,16 @@ final class Qwen35GatedDeltaNet: Module {
         let B = x.dim(0)
         let S = x.dim(1)
 
-        var (qkv, z, b, a) = projectInputs(x, batch: B, sequence: S)
+        var (qkv, z, gates, zSource, qkvSource) = projectInputs(x, batch: B, sequence: S)
 
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
+            qkvSource = GateSource(array: qkv, offset: 0, rowLength: convDim)
         }
 
-        let fusedDecode =
-            S == 1 && mask == nil && (qkv.dtype == .float16 || qkv.dtype == .bfloat16)
-        let (convPre, newConvState) =
-            fusedDecode
-            ? decodeConv(convState: convState, qkv: qkv)
-            : generalConv(convState: convState, qkv: qkv)
-        let convOut = silu(convPre)
-
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let (qNormed, kNormed) = normalizedQK(q: q, k: k)
+        let (qNormed, kNormed, v, newConvState) = convNormQKV(
+            convState: convState, qkv: qkv, qkvSource: qkvSource, mask: mask, batch: B,
+            sequence: S)
 
         let out: MLXArray
         let newRecState: MLXArray
@@ -409,20 +455,14 @@ final class Qwen35GatedDeltaNet: Module {
                 q: qNormed[0..., ..<split, 0..., 0...],
                 k: kNormed[0..., ..<split, 0..., 0...],
                 v: v[0..., ..<split, 0..., 0...],
-                a: a[0..., ..<split, 0...],
-                b: b[0..., ..<split, 0...],
-                aLog: aLog,
-                dtBias: dtBias,
+                gates: .source(gates.rows(..<split)),
                 state: recState,
                 mask: prefixMask)
             let (suffixOut, suffixState) = gatedDeltaUpdate(
                 q: qNormed[0..., split..., 0..., 0...],
                 k: kNormed[0..., split..., 0..., 0...],
                 v: v[0..., split..., 0..., 0...],
-                a: a[0..., split..., 0...],
-                b: b[0..., split..., 0...],
-                aLog: aLog,
-                dtBias: dtBias,
+                gates: .source(gates.rows(split...)),
                 state: prefixState,
                 mask: suffixMask)
             out = concatenated([prefixOut, suffixOut], axis: 1)
@@ -443,28 +483,82 @@ final class Qwen35GatedDeltaNet: Module {
                 q: qNormed,
                 k: kNormed,
                 v: v,
-                a: a,
-                b: b,
-                aLog: aLog,
-                dtBias: dtBias,
+                gates: .source(gates),
                 state: recState,
                 mask: mask)
             checkpoint = nil
         }
 
-        let gated = norm(out, gate: z)
+        // The decode step's compiled trace runs the gate in f32 with the
+        // precise exp; the fused kernel reproduces that, so it serves the
+        // single-token step and the prefill keeps the separate ops.
+        let gated = (S == 1 ? fusedNormGate(out, gate: zSource) : nil) ?? norm(out, gate: z)
         return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint)
     }
 
-    /// The weightless q/k RMS norms with the head scaling folded in.
-    private func normalizedQK(q: MLXArray, k: MLXArray) -> (MLXArray, MLXArray) {
-        let dtype = q.dtype
+    /// The head-scaling scalars in the activation dtype, built once: the
+    /// per-call scalar casts were two GPU launches per layer per pass.
+    private let qkScaleCache = QKScaleCache()
+    private func qkScales(_ dtype: DType) -> (q: MLXArray, k: MLXArray, pair: MLXArray) {
+        if let cached = qkScaleCache.scales, cached.dtype == dtype {
+            return (cached.q, cached.k, cached.pair)
+        }
         let invScale = pow(Float(headKDim), -0.5)
+        let q = MLXArray(pow(invScale, 2)).asType(dtype)
+        let k = MLXArray(invScale).asType(dtype)
+        let pair = concatenated([q.reshaped([1]), k.reshaped([1])])
+        eval(q, k, pair)
+        qkScaleCache.scales = (dtype, q, k, pair)
+        return (q, k, pair)
+    }
+
+    /// `silu(conv1d(convInput))` split into the normed, scaled `q`/`k` and
+    /// `v` as one launch; nil when the kernel does not cover the shape.
+    private func fusedConvNormQKV(convState: MLXArray, qkvSource: GateSource) -> (
+        q: MLXArray, k: MLXArray, v: MLXArray, convInput: MLXArray, nextConvState: MLXArray
+    )? {
+        guard headKDim == headVDim, qkvSource.array.dtype == .bfloat16 else { return nil }
+        return gatedDeltaConvNormQKV(
+            convState: convState, rows: qkvSource.array, rowOffset: qkvSource.offset,
+            weight: conv1d.weight, numKHeads: numKHeads, numVHeads: numVHeads,
+            headDim: headKDim, scales: qkScales(qkvSource.array.dtype).pair, eps: 1e-6)
+    }
+
+    /// The conv → silu → q/k norm → head scale stage and the next conv
+    /// state: one launch where the fused kernel applies, else the separate
+    /// ops (`decodeConv` folds into the compiled decode step for S == 1).
+    private func convNormQKV(
+        convState: MLXArray, qkv: MLXArray, qkvSource: GateSource, mask: MLXArray?,
+        batch B: Int, sequence S: Int
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray, convState: MLXArray) {
+        if let fused = fusedConvNormQKV(convState: convState, qkvSource: qkvSource) {
+            return (fused.q, fused.k, fused.v, fused.nextConvState)
+        }
+        let fusedDecode =
+            S == 1 && mask == nil && (qkv.dtype == .float16 || qkv.dtype == .bfloat16)
+        let (convPre, newConvState) =
+            fusedDecode
+            ? decodeConv(convState: convState, qkv: qkv)
+            : generalConv(convState: convState, qkv: qkv)
+        let (q, k, v) = normalizedQKV(silu(convPre), batch: B, sequence: S)
+        return (q, k, v, newConvState)
+    }
+
+    /// Split the conv output into the normed, scaled `q`/`k` and `v`. The
+    /// weightless q/k RMS norms run as one launch over the adjacent q|k
+    /// channels: every head row normalizes independently, so the result is
+    /// bit-identical to two launches, and the head scaling folds in after.
+    private func normalizedQKV(
+        _ convOut: MLXArray, batch B: Int, sequence S: Int
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let qk = MLXFast.rmsNorm(
+            convOut[.ellipsis, ..<(2 * keyDim)].reshaped(B, S, 2 * numKHeads, headKDim),
+            weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qScale, kScale, _) = qkScales(convOut.dtype)
         return (
-            MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
-            MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            qScale * qk[.ellipsis, ..<numKHeads, 0...],
+            kScale * qk[.ellipsis, numKHeads..., 0...],
+            convOut[.ellipsis, (2 * keyDim)...].reshaped(B, S, numVHeads, headVDim)
         )
     }
 
@@ -476,25 +570,31 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> (output: MLXArray, convState: MLXArray, capture: GatedDeltaCapture) {
         let B = x.dim(0)
         let S = x.dim(1)
-        let (qkv, z, b, a) = projectInputs(x, batch: B, sequence: S)
+        let (qkv, z, gates, zSource, qkvSource) = projectInputs(x, batch: B, sequence: S)
 
-        // One concat serves the conv, the next conv state and the capture.
-        let convInput = concatenated([convState, qkv], axis: 1)
-        let newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
-        let convOut = silu(conv1d(convInput))
+        // The fused kernel emits the conv input block (the capture's) and the
+        // next conv state from its own reads; the ops build them with a concat.
+        let q: MLXArray
+        let k: MLXArray
+        let v: MLXArray
+        let convInput: MLXArray
+        let newConvState: MLXArray
+        if let fused = fusedConvNormQKV(convState: convState, qkvSource: qkvSource) {
+            (q, k, v, convInput, newConvState) = fused
+        } else {
+            convInput = concatenated([convState, qkv], axis: 1)
+            newConvState = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
+            (q, k, v) = normalizedQKV(silu(conv1d(convInput)), batch: B, sequence: S)
+        }
 
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let (q, k) = normalizedQK(
-            q: convSplit[0].reshaped(B, S, numKHeads, headKDim),
-            k: convSplit[1].reshaped(B, S, numKHeads, headKDim))
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        let (out, _) = gatedDeltaUpdate(
-            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias, state: recState)
+        // The kernel reads the gates out of the projection row, which rides
+        // in the capture; the final state is never stored (the replay
+        // rebuilds it).
+        let out = gatedDeltaOutput(q: q, k: k, v: v, gates: .source(gates), state: recState)
         let capture = GatedDeltaCapture(
-            convInput: convInput, q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
-            initialState: recState)
-        return (outProj(norm(out, gate: z).reshaped(B, S, -1)), newConvState, capture)
+            convInput: convInput, k: k, v: v, gates: .source(gates), initialState: recState)
+        let gated = fusedNormGate(out, gate: zSource) ?? norm(out, gate: z)
+        return (outProj(gated.reshaped(B, S, -1)), newConvState, capture)
     }
 
     /// The S == 1 depthwise conv as elementwise multiply-adds, so `compile`
@@ -1282,10 +1382,11 @@ public class Qwen35TextModelInner: Module {
             for layerIndex in segment.linearLayers {
                 let mambaCache = cache[layerIndex] as! MambaCache
                 let gdn = layers[layerIndex].linearAttn!
+                let count = GatedDeltaCapture.arrayCount
                 recurrentCaptures[layerIndex] = GatedDeltaCapture(
-                    arrays: Array(outputs[(next + 1) ..< (next + 7)]),
-                    aLog: gdn.aLog, dtBias: gdn.dtBias, initialState: mambaCache[1]!)
-                next += 7
+                    arrays: Array(outputs[(next + 1) ..< (next + 1 + count)]),
+                    initialState: mambaCache[1]!, layout: gdn.captureGateLayout)
+                next += 1 + count
                 if captureLayers.contains(layerIndex) { capturedHere.append(layerIndex) }
             }
             for layerIndex in capturedHere {

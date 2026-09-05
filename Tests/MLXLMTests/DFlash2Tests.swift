@@ -425,17 +425,17 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
             visibleLength: request.positionUpperBound + positions)
         let mamba = cache[1] as! MambaCache
         MLXRandom.seed(UInt64(1000 + verifyCalls))
-        let capture = GatedDeltaCapture(
-            convInput: MLXRandom.normal([1, Self.K - 1 + positions, Self.convDim])
-                .asType(.bfloat16),
-            q: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
-            k: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
-            v: MLXRandom.normal([1, positions, Self.Hv, Self.Dv]).asType(.bfloat16),
+        let (g, beta) = gatedDeltaGates(
             a: MLXRandom.normal([1, positions, Self.Hv]).asType(.bfloat16),
             b: MLXRandom.normal([1, positions, Self.Hv]).asType(.bfloat16),
             aLog: MLXRandom.normal([Self.Hv]).asType(.float32),
-            dtBias: MLXRandom.normal([Self.Hv]).asType(.float32),
-            initialState: mamba[1]!)
+            dtBias: MLXRandom.normal([Self.Hv]).asType(.float32))
+        let capture = GatedDeltaCapture(
+            convInput: MLXRandom.normal([1, Self.K - 1 + positions, Self.convDim])
+                .asType(.bfloat16),
+            k: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
+            v: MLXRandom.normal([1, positions, Self.Hv, Self.Dv]).asType(.bfloat16),
+            g: g, beta: beta, initialState: mamba[1]!)
         return DFlash2VerifyResult(
             logits: logits(for: request.tokens),
             hidden: request.captureLayers.map { _ in
@@ -652,15 +652,17 @@ func testGatedDeltaCaptureReplayMatchesPrefix() throws {
     let (B, S, Hk, Dk, Hv, Dv, K) = (1, 6, 2, 32, 4, 16, 4)
     let convDim = 2 * Hk * Dk + Hv * Dv
     MLXRandom.seed(11)
+    let q = MLXRandom.normal([B, S, Hk, Dk]).asType(.bfloat16)
+    let k = MLXRandom.normal([B, S, Hk, Dk]).asType(.bfloat16)
+    let v = MLXRandom.normal([B, S, Hv, Dv]).asType(.bfloat16)
+    let a = MLXRandom.normal([B, S, Hv]).asType(.bfloat16)
+    let b = MLXRandom.normal([B, S, Hv]).asType(.bfloat16)
+    let aLog = MLXRandom.normal([Hv]).asType(.float32)
+    let dtBias = MLXRandom.normal([Hv]).asType(.float32)
+    let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
     let capture = GatedDeltaCapture(
         convInput: MLXRandom.normal([B, K - 1 + S, convDim]).asType(.bfloat16),
-        q: MLXRandom.normal([B, S, Hk, Dk]).asType(.bfloat16),
-        k: MLXRandom.normal([B, S, Hk, Dk]).asType(.bfloat16),
-        v: MLXRandom.normal([B, S, Hv, Dv]).asType(.bfloat16),
-        a: MLXRandom.normal([B, S, Hv]).asType(.bfloat16),
-        b: MLXRandom.normal([B, S, Hv]).asType(.bfloat16),
-        aLog: MLXRandom.normal([Hv]).asType(.float32),
-        dtBias: MLXRandom.normal([Hv]).asType(.float32),
+        k: k, v: v, g: g, beta: beta,
         initialState: MLXRandom.normal([B, Hv, Dv, Dk]).asType(.float32))
 
     for validCount in [1, 4, S] {
@@ -668,14 +670,45 @@ func testGatedDeltaCaptureReplayMatchesPrefix() throws {
         let count = MLXArray(Int32(validCount - 1)) + Int32(1)
         let (recurrent, conv) = capture.replay(validCount: count)
         let (_, expected) = gatedDeltaUpdate(
-            q: capture.q[0..., ..<validCount], k: capture.k[0..., ..<validCount],
-            v: capture.v[0..., ..<validCount], a: capture.a[0..., ..<validCount],
-            b: capture.b[0..., ..<validCount], aLog: capture.aLog, dtBias: capture.dtBias,
+            q: q[0..., ..<validCount], k: k[0..., ..<validCount],
+            v: v[0..., ..<validCount], a: a[0..., ..<validCount],
+            b: b[0..., ..<validCount], aLog: aLog, dtBias: dtBias,
             state: capture.initialState)
         eval(recurrent, expected, conv)
         #expect((recurrent - expected).abs().max().item(Float.self) < 1e-3)
         let expectedConv = capture.convInput[0..., validCount ..< (validCount + K - 1), 0...]
         #expect((conv - expectedConv).abs().max().item(Float.self) == 0)
+    }
+}
+
+@Test(arguments: [DType.bfloat16, .float16, .float32], [32, 128, 33])
+func testGatedDeltaStateOnlyReplayIsBitwiseExact(dtype: DType, keyDimension: Int) {
+    let (batch, length, keyHeads, valueHeads, valueDimension) = (2, 8, 2, 4, 16)
+    let q = (MLXRandom.normal([batch, length, keyHeads, keyDimension]) * 0.05).asType(dtype)
+    let k = (MLXRandom.normal(q.shape) * 0.05).asType(dtype)
+    let v = MLXRandom.normal([batch, length, valueHeads, valueDimension]).asType(dtype)
+    let a = MLXRandom.normal([batch, length, valueHeads]).asType(dtype)
+    let b = MLXRandom.normal(a.shape).asType(dtype)
+    let aLog = MLXRandom.normal([valueHeads])
+    let dtBias = MLXRandom.normal([valueHeads])
+    let initial = MLXRandom.normal([batch, valueHeads, valueDimension, keyDimension])
+    let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+    for count in 0 ... length {
+        let lazyCount = MLXArray(Int32(count - 1)) + Int32(1)
+        let rowMask = MLXArray(Int32(0) ..< Int32(length)) .< lazyCount
+        let mask = broadcast(rowMask[.newAxis], to: [batch, length])
+        let (expectedOutput, expected) = gatedDeltaUpdate(
+            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+            state: initial, mask: mask)
+        let actual = gatedDeltaStateAfter(
+            validCount: lazyCount, k: k, v: v, g: g, beta: beta, state: initial)
+        #expect(actual.asArray(Float.self) == expected.asArray(Float.self), "prefix \(count)")
+        if count == length {
+            // The output-only variant matches the fused kernel bit for bit.
+            let output = gatedDeltaOutput(q: q, k: k, v: v, g: g, beta: beta, state: initial)
+            #expect(
+                output.asArray(Float.self) == expectedOutput.asArray(Float.self), "output")
+        }
     }
 }
 

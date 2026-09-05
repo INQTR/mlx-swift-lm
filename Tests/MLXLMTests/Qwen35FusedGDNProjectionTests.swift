@@ -95,18 +95,18 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
 
             layer.fusedInputProjectionEnabled = false
             let reference = layer.projectInputs(input, batch: batch, sequence: sequence)
-            eval(reference.qkv, reference.z, reference.b, reference.a)
+            eval(reference.qkv, reference.z, reference.gates.b, reference.gates.a)
 
             layer.fusedInputProjectionEnabled = true
             XCTAssertTrue(try layer.prepareFusedInputProjection())
             let fused = layer.projectInputs(input, batch: batch, sequence: sequence)
-            eval(fused.qkv, fused.z, fused.b, fused.a)
+            eval(fused.qkv, fused.z, fused.gates.b, fused.gates.a)
 
             XCTAssertTrue(layer.hasFusedInputProjection)
             assertBitIdentical(fused.qkv, reference.qkv, "qkv B\(batch) S\(sequence)")
             assertBitIdentical(fused.z, reference.z, "z B\(batch) S\(sequence)")
-            assertBitIdentical(fused.b, reference.b, "b B\(batch) S\(sequence)")
-            assertBitIdentical(fused.a, reference.a, "a B\(batch) S\(sequence)")
+            assertBitIdentical(fused.gates.b, reference.gates.b, "b B\(batch) S\(sequence)")
+            assertBitIdentical(fused.gates.a, reference.gates.a, "a B\(batch) S\(sequence)")
         }
     }
 
