@@ -650,10 +650,28 @@ final class Qwen35Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rope: RoPELayer
+    /// What the fused norm + rope kernel needs of `rope`; nil disables it.
+    let plainRope: PlainRoPEParameters?
 
     /// Post-load stacked `q|k|v`; see `SameInputProjectionStacking`.
     var qkvStacked: QuantizedLinear?
     var qkvStackedDims: (q: Int, k: Int) = (0, 0)
+
+    /// The query norm weight with the attention scale folded in, when the
+    /// scale is a power of two: `w * 2^-n` is exact, so the normed queries
+    /// are bitwise `scale * qNorm(q)` and the kernel's own scale becomes 1.
+    private let foldedQueryScale = FoldedQueryScaleCache()
+
+    /// The scale the attention kernel still has to apply.
+    var kernelScale: Float { foldedQueryScale.weight == nil ? scale : 1.0 }
+
+    /// Builds the folded query norm weight (a single evaluated array).
+    func foldQueryScale() {
+        guard foldedQueryScale.weight == nil, scale.significand == 1.0 else { return }
+        let weight = qNorm.weight * MLXArray(scale).asType(qNorm.weight.dtype)
+        eval(weight)
+        foldedQueryScale.weight = weight
+    }
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -681,6 +699,9 @@ final class Qwen35Attention: Module {
             scalingConfig: args.ropeScaling,
             maxPositionEmbeddings: args.maxPositionEmbeddings
         )
+        self.plainRope = PlainRoPEParameters(
+            dims: max(1, ropeDims), base: args.ropeTheta, traditional: false,
+            scalingConfig: args.ropeScaling)
 
         super.init()
     }
@@ -689,22 +710,67 @@ final class Qwen35Attention: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
         positionOffset: Int? = nil
     ) -> MLXArray {
-        let (q, gate, k, values) = projectPreRope(x)
-
         let offset = positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset
-        let queries = applyRotaryPosition(rope, to: q, offset: offset)
-        let keys = applyRotaryPosition(rope, to: k, offset: offset)
+        let offsetArray: MLXArray
+        switch offset {
+        case nil: offsetArray = MLXArray([Int32(0)])
+        case .scalar(let v): offsetArray = MLXArray([Int32(v)])
+        case .batch(let a): offsetArray = a
+        }
+        let queries: MLXArray
+        let gate: MLXArray
+        let keys: MLXArray
+        let values: MLXArray
+        if let fused = projectNormRope(x, offset: offsetArray) {
+            (queries, gate, keys, values) = fused
+        } else {
+            let (q, g, k, v) = projectPreRope(x)
+            queries = applyRotaryPosition(rope, to: q, offset: offset)
+            gate = g
+            keys = applyRotaryPosition(rope, to: k, offset: offset)
+            values = v
+        }
 
         let output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
             cache: cache,
-            scale: scale,
+            scale: kernelScale,
             mask: mask
         )
 
         return mergeHeadsAndProject(attention: output, gate: gate)
+    }
+
+    /// The stacked projection with both norms and the rope in one launch
+    /// (`attentionNormRope` reads the q and k heads out of the projection
+    /// row): `x` → (queries, gate, keys, values). Nil when the kernel does
+    /// not serve (unstacked projections, a scaled rope, non-bf16).
+    func projectNormRope(_ x: MLXArray, offset: MLXArray) -> (
+        MLXArray, MLXArray, MLXArray, MLXArray
+    )? {
+        guard let qkvStacked, let plainRope, qNorm.eps == kNorm.eps
+        else { return nil }
+        let headDim = qNorm.weight.dim(0)
+        guard qkvStackedDims.q == attentionHeads * headDim * 2 else { return nil }
+        let all = qkvStacked(x)
+        let qEnd = qkvStackedDims.q
+        let kEnd = qEnd + qkvStackedDims.k
+        guard
+            let (queries, keys) = attentionNormRope(
+                rows: all, queryOffset: 0, queryHeadStride: 2 * headDim,
+                queryHeads: attentionHeads, keyOffset: qEnd, keyHeadStride: headDim,
+                keyHeads: kvHeads, headDim: headDim,
+                queryWeight: foldedQueryScale.weight ?? qNorm.weight, keyWeight: kNorm.weight,
+                eps: qNorm.eps, rope: plainRope, offset: offset)
+        else { return nil }
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let gate = all[.ellipsis, ..<qEnd].reshaped(B, L, attentionHeads, -1).split(
+            parts: 2, axis: -1)[1]
+        let values = all[.ellipsis, kEnd...].reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        return (queries, gate, keys, values)
     }
 
     /// Projections up to (not including) rope: `x` → (queries, gate, keys,
@@ -730,22 +796,25 @@ final class Qwen35Attention: Module {
         }
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
-        let gate = qSplit[1].reshaped(B, L, -1)
+        // Head-major `[B, L, heads, headDim]` view; `mergeHeadsAndProject`
+        // consumes it as is.
+        let gate = qSplit[1]
 
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        queries = MLXFast.rmsNorm(
+            queries, weight: foldedQueryScale.weight ?? qNorm.weight, eps: qNorm.eps
+        ).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         return (queries, gate, keys, values)
     }
 
-    /// Attention tail: head merge → output gate → output projection.
+    /// Attention tail: output gate → head merge → output projection. The
+    /// gate multiply reads the head-major views of both operands, so neither
+    /// the attention output nor the gate is copied to merge the heads.
     func mergeHeadsAndProject(attention: MLXArray, gate: MLXArray) -> MLXArray {
-        let merged =
-            attention
-            .transposed(0, 2, 1, 3)
-            .reshaped(attention.dim(0), attention.dim(2), -1)
-        return oProj(sigmoidMultiply(merged, gate))
+        let gated = sigmoidMultiply(attention.transposed(0, 2, 1, 3), gate)
+        return oProj(gated.reshaped(attention.dim(0), attention.dim(2), -1))
     }
 }
 
@@ -985,7 +1054,7 @@ final class Qwen35DecoderLayer: Module {
             keys: keys,
             values: values,
             cache: cache,
-            scale: selfAttn!.scale,
+            scale: selfAttn!.kernelScale,
             mask: mask
         )
     }
@@ -1018,7 +1087,9 @@ final class Qwen35DecoderLayer: Module {
         MLXArray, MLXArray, MLXArray, MLXArray
     ) {
         let attn = selfAttn!
-        let (queries, gate, keys, values) = attn.projectPreRope(inputLayerNorm(x))
+        let input = inputLayerNorm(x)
+        if let fused = attn.projectNormRope(input, offset: ropeOffset) { return fused }
+        let (queries, gate, keys, values) = attn.projectPreRope(input)
         return (
             applyRotaryPosition(attn.rope, to: queries, offset: .batch(ropeOffset)),
             gate,
@@ -1402,7 +1473,7 @@ public class Qwen35TextModelInner: Module {
                     position: request.position, visibleLength: visibleLength)
                 let attention = MLXFast.scaledDotProductAttention(
                     queries: outputs[next], keys: keys, values: values,
-                    scale: layers[pre].selfAttn!.scale, mask: .array(mask))
+                    scale: layers[pre].selfAttn!.kernelScale, mask: .array(mask))
                 pendingAttention = [attention, outputs[next + 1]]
             }
         }
@@ -1494,6 +1565,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             if let linearAttn = layer.linearAttn {
                 _ = try linearAttn.prepareFusedInputProjection()
             }
+            layer.selfAttn?.foldQueryScale()
         }
     }
 

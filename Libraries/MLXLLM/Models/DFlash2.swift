@@ -253,6 +253,9 @@ final class DFlash2Attention: Module {
 
     var qkvStacked: QuantizedLinear?
     var kvStacked: QuantizedLinear?
+    /// What the fused norm + rope kernel needs of the model's rope (built
+    /// from the config the model builds its rope from); nil disables it.
+    let plainRope: PlainRoPEParameters?
 
     init(_ config: DFlash2Configuration) {
         numHeads = config.attentionHeads
@@ -265,6 +268,9 @@ final class DFlash2Attention: Module {
         _oProj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
+        plainRope = PlainRoPEParameters(
+            dims: config.headDim, base: config.ropeTheta, traditional: false,
+            scalingConfig: config.ropeScaling)
         super.init()
     }
 
@@ -278,6 +284,19 @@ final class DFlash2Attention: Module {
             let all = qkvStacked(x)
             let qEnd = numHeads * headDim
             let kEnd = qEnd + numKVHeads * headDim
+            // Both norms and the rope in one launch, reading the heads out
+            // of the projection row.
+            if let plainRope, qNorm.eps == kNorm.eps,
+                let fused = attentionNormRope(
+                    rows: all, queryOffset: 0, queryHeadStride: headDim, queryHeads: numHeads,
+                    keyOffset: qEnd, keyHeadStride: headDim, keyHeads: numKVHeads,
+                    headDim: headDim, queryWeight: qNorm.weight, keyWeight: kNorm.weight,
+                    eps: qNorm.eps, rope: plainRope, offset: position)
+            {
+                let values = all[.ellipsis, kEnd...].reshaped(b, l, numKVHeads, headDim)
+                    .transposed(0, 2, 1, 3)
+                return (fused.queries, fused.keys, values)
+            }
             (q, k, v) = (
                 all[.ellipsis, ..<qEnd], all[.ellipsis, qEnd ..< kEnd], all[.ellipsis, kEnd...]
             )
@@ -303,6 +322,17 @@ final class DFlash2Attention: Module {
         if let kvStacked {
             let all = kvStacked(x)
             let kEnd = numKVHeads * headDim
+            if let plainRope,
+                let fused = attentionNormRope(
+                    rows: all, queryOffset: 0, queryHeadStride: headDim, queryHeads: 0,
+                    keyOffset: 0, keyHeadStride: headDim, keyHeads: numKVHeads, headDim: headDim,
+                    queryWeight: kNorm.weight, keyWeight: kNorm.weight, eps: kNorm.eps,
+                    rope: plainRope, offset: position)
+            {
+                let values = all[.ellipsis, kEnd...].reshaped(b, s, numKVHeads, headDim)
+                    .transposed(0, 2, 1, 3)
+                return (fused.keys, values)
+            }
             (k, v) = (all[.ellipsis, ..<kEnd], all[.ellipsis, kEnd...])
         } else {
             (k, v) = (kProj(x), vProj(x))
