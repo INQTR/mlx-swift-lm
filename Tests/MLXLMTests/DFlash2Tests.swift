@@ -241,7 +241,12 @@ func testDFlash2DynamicConvMatchesNaive() throws {
     // bf16 rounding in the module vs f32 accumulation in the loop.
     let expectedPre = naive(hidden, baseRow: 0, dynamic: kernel0)
     let preparedF = prepared.asType(.float32)
-    let expectedFin = naive(hidden, baseRow: 1, dynamic: kernel)
+    // The fused path hands back the raw projection row; take its slot-1 taps.
+    let kernel1 =
+        kernel.ndim == 3
+        ? kernel.reshaped(1, 5, 2, kernelSize, hiddenSize / groupSize)[0..., 0..., 1, 0..., 0...]
+        : kernel
+    let expectedFin = naive(hidden, baseRow: 1, dynamic: kernel1)
     let finishedF = finished.asType(.float32)
     for t in 0 ..< 5 {
         for ch in 0 ..< hiddenSize {
@@ -271,6 +276,26 @@ func testRMSNormResidualIsBitwiseExact() throws {
         let fused = rmsNormResidual(x, r, weight: weight, eps: eps)
         #expect((fused.h .== h).all().item(Bool.self), "sum axis \(axis) \(dtype)")
         #expect((fused.out .== reference).all().item(Bool.self), "norm axis \(axis) \(dtype)")
+    }
+}
+
+@Test
+func testTopKIndicesMatchesArgPartitionOrder() throws {
+    // Chunk boundaries (4096 per stage-1 threadgroup), heavy ties, and both
+    // float widths; the kernel must reproduce the stable sort's tail exactly.
+    for (seed, vocab, k, dtype) in [
+        (1, 12, 3, DType.float32), (2, 3000, 16, .bfloat16), (3, 5000, 16, .bfloat16),
+        (4, 8193, 16, .float32), (5, 20481, 20, .float16),
+    ] as [(UInt64, Int, Int, DType)] {
+        MLXRandom.seed(seed)
+        let logits = (MLXRandom.normal([2, 3, vocab]) * 3).round().asType(dtype)
+        let reference = argPartition(logits, kth: vocab - k, axis: -1)[.ellipsis, (vocab - k)...]
+        let candidate = topKIndices(logits, k: k)
+        #expect(candidate.shape == [2, 3, k])
+        #expect(candidate.dtype == .uint32)
+        #expect(
+            (reference .== candidate).all().item(Bool.self),
+            "vocab \(vocab) k \(k) \(dtype)")
     }
 }
 
@@ -807,11 +832,17 @@ func testDFlash2CompiledProposalMatchesEager() throws {
     let concatDim = config.dflash.targetLayerIds.count * config.hiddenSize
     // A 20-row first context takes the eager projection; later rounds trace.
     let rounds: [(rows: Int, valid: Int, width: Int)] = [
-        (20, 20, 5), (3, 2, 5), (1, 1, 3), (5, 4, 5),
+        (20, 20, 5), (3, 2, 5), (1, 1, 3), (5, 4, 5), (3, 1, 5),
     ]
     var position = 0
     var anchor: Int32 = 7
     for (round, spec) in rounds.enumerated() {
+        if round == 1 || round == 4 {
+            // Trace inputs must include every weight read by each segment.
+            let updated = DFlash2DraftModel(config)
+            try compiled.update(parameters: updated.parameters(), verify: [])
+            try eager.update(parameters: updated.parameters(), verify: [])
+        }
         let targetHidden = MLXRandom.normal([1, spec.rows, concatDim])
         let block = MLXArray(
             [anchor] + Array(repeating: Int32(config.dflash.maskTokenId), count: spec.width - 1)

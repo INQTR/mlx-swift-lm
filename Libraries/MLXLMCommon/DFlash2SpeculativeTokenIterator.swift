@@ -339,6 +339,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             newTokens = Array(newTokens.prefix(Swift.max(0, maxTokens - tokenCount)))
         }
         pendingTokens.append(contentsOf: newTokens)
+        drafter.observeCommitted(newTokens)
         committedAcceptedCount = accepted
         producedTokens += accepted + 1
         anchorPosition = committed

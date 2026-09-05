@@ -90,6 +90,15 @@ public protocol DFlash2DrafterModel: BaseLanguageModel {
         target: any DFlash2TargetModel,
         state: inout DFlash2DrafterState
     ) -> DFlash2Proposal
+
+    /// Tokens the iterator just committed (accepted drafts and the bonus),
+    /// so a drafter that predicts over a vocabulary prefix can widen when
+    /// the target leaves it. Default: ignored.
+    func observeCommitted(_ tokens: [Int])
+}
+
+extension DFlash2DrafterModel {
+    public func observeCommitted(_ tokens: [Int]) {}
 }
 
 // MARK: - Target
@@ -282,10 +291,12 @@ extension KVCacheSimple {
                 values = grownValues
             }
         }
-        let rows = (position.asType(.int32) + MLXArray(Int32(0) ..< Int32(newKeys.dim(2))))
-            .reshaped([1, 1, -1, 1])
-        keys = putAlong(keys!, rows, values: newKeys, axis: 2)
-        values = putAlong(values!, rows, values: newValues, axis: 2)
+        // A dynamic slice update, not a scatter: the rows are contiguous, and
+        // the mlx fork can write them in place (MLX_DYNSLICE_INPLACE=1)
+        // instead of copying the whole store per pass.
+        let start = position.asType(.int32).reshaped([1])
+        keys = dynamicSliceUpdated(keys!, update: newKeys, start: start, axes: [2])
+        values = dynamicSliceUpdated(values!, update: newValues, start: start, axes: [2])
         return (
             keys![.ellipsis, ..<visibleLength, 0...],
             values![.ellipsis, ..<visibleLength, 0...]
@@ -360,6 +371,29 @@ public final class DFlash2ContextCache {
         rowPositions.append(contentsOf: positions)
         rowValid.append(contentsOf: Array(repeating: false, count: n))
         return (keys!, values!)
+    }
+
+    /// The stored rows followed by the block's own `n` rows, written into
+    /// the store's slack past the stored count (a dynamic slice update, in
+    /// place under the fork's `MLX_DYNSLICE_INPLACE`) and returned as views,
+    /// so a pass never concatenates the context with the block. The scratch
+    /// rows are overwritten by the next `append`. Falls back to a concat when
+    /// the store has no room.
+    package func withBlock(
+        keys blockKeys: MLXArray, values blockValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let n = blockKeys.dim(2)
+        guard let keyStore, let valueStore, storedCount + n <= keyStore.dim(2) else {
+            return (
+                concatenated([keys ?? blockKeys[.ellipsis, ..<0, 0...], blockKeys], axis: 2),
+                concatenated([values ?? blockValues[.ellipsis, ..<0, 0...], blockValues], axis: 2)
+            )
+        }
+        let start = MLXArray([Int32(storedCount)])
+        let k = dynamicSliceUpdated(keyStore, update: blockKeys, start: start, axes: [2])
+        let v = dynamicSliceUpdated(valueStore, update: blockValues, start: start, axes: [2])
+        let visible = storedCount + n
+        return (k[.ellipsis, ..<visible, 0...], v[.ellipsis, ..<visible, 0...])
     }
 
     /// Commit the first `valid` of the newest `newest` rows; the rest stay

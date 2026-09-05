@@ -190,46 +190,115 @@ final class DFlash2DynamicConv: Module {
         super.init()
     }
 
-    /// hidden `[B, L, H]`, dynamic `[B, L, K, groups]`, base `[K, H]`. The
-    /// block's first position reads nothing before it: the shift zero-pads.
+    /// Per-slot base taps in the activation dtype, shaped for the grouped
+    /// broadcast. The parameter is fixed after load, so they are built once
+    /// instead of three gathers and two casts per convolution.
+    private let tapCache = DynamicConvTapCache()
+
+    private func baseTaps(slot: Int, dtype: DType, groups: Int) -> [MLXArray] {
+        if let cached = tapCache.taps[slot], cached.dtype == dtype {
+            return cached.taps
+        }
+        let taps = (0 ..< kernelSize).map {
+            baseKernel[slot, $0].asType(dtype).reshaped(1, 1, groups, groupSize)
+        }
+        tapCache.taps[slot] = (dtype, taps)
+        return taps
+    }
+
+    /// The slot's base taps as one `[K, H]` array, for the fused kernel.
+    private func baseFlat(slot: Int, dtype: DType) -> MLXArray {
+        if let cached = tapCache.flat[slot], cached.dtype == dtype {
+            return cached.taps
+        }
+        let flat = baseKernel[slot].asType(dtype)
+        tapCache.flat[slot] = (dtype, flat)
+        return flat
+    }
+
+    /// Build and evaluate both slots' taps outside any compiled trace, so
+    /// the traces capture them as constants instead of recomputing them.
+    func warmTaps(dtype: DType, hiddenSize: Int) {
+        let groups = hiddenSize / groupSize
+        for slot in 0 ..< 2 {
+            eval(baseTaps(slot: slot, dtype: dtype, groups: groups))
+            eval(baseFlat(slot: slot, dtype: dtype))
+        }
+    }
+
+    /// The fused conv over one slot of the projection row, nil off-shape.
+    private func fusedConvolve(_ hidden: MLXArray, projection: MLXArray, slot: Int) -> MLXArray? {
+        let groups = hidden.dim(-1) / groupSize
+        return dflash2DynamicConv(
+            hidden, dynamic: projection, dynamicOffset: slot * kernelSize * groups,
+            dynamicRowLength: 2 * kernelSize * groups,
+            base: baseFlat(slot: slot, dtype: hidden.dtype), kernelSize: kernelSize,
+            groupSize: groupSize)
+    }
+
+    /// hidden `[B, L, H]`, dynamic `[B, L, K, groups]`, taps `K x [1, 1,
+    /// groups, groupSize]`. The block's first position reads nothing before
+    /// it: the shift zero-pads.
     private static func convolve(
-        _ hidden: MLXArray, dynamic: MLXArray, base: MLXArray, groupSize: Int
+        _ hidden: MLXArray, dynamic: MLXArray, taps: [MLXArray], groupSize: Int
     ) -> MLXArray {
         let (b, l, h) = (hidden.dim(0), hidden.dim(1), hidden.dim(2))
         let groups = h / groupSize
         let blocks = hidden.reshaped(b, l, groups, groupSize)
-        var output = MLXArray.zeros(like: blocks)
-        for tap in 0 ..< base.dim(0) {
-            let values: MLXArray
-            if tap == 0 {
-                values = blocks
-            } else {
-                values = concatenated(
-                    [MLXArray.zeros(like: blocks[0..., ..<tap]), blocks[0..., ..<(l - tap)]],
-                    axis: 1)
-            }
-            let baseKernel = base[tap].asType(hidden.dtype).reshaped(1, 1, groups, groupSize)
-            output = output + baseKernel * values
-            output = output + dynamic[0..., 0..., tap, 0..., .newAxis] * values
+        var output: MLXArray? = nil
+        for (tap, baseKernel) in taps.enumerated() {
+            let values =
+                tap == 0
+                ? blocks
+                : padded(
+                    blocks[0..., ..<(l - tap)],
+                    widths: [IntOrPair(0), IntOrPair((tap, 0)), IntOrPair(0), IntOrPair(0)])
+            let base = baseKernel * values
+            output = output.map { $0 + base } ?? base
+            output = output! + dynamic[0..., 0..., tap, 0..., .newAxis] * values
         }
-        return output.reshaped(hidden.shape)
+        return output!.reshaped(hidden.shape)
     }
 
+    /// The convolved input and the kernel `finish` needs: the whole
+    /// projection row `[B, L, 2 * K * groups]` when the fused kernel serves
+    /// (slot 1 is read by offset, so nothing is sliced or copied), else the
+    /// slot-1 `[B, L, K, groups]` slice for the ops.
     func prepare(_ hidden: MLXArray) -> (convolved: MLXArray, kernel: MLXArray) {
         let groups = hidden.dim(-1) / groupSize
-        let dynamic = kernelProjection(hidden).reshaped(
-            hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
+        let projection = kernelProjection(hidden)
+        if let fused = fusedConvolve(hidden, projection: projection, slot: 0) {
+            return (fused, projection)
+        }
+        let dynamic = projection.reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)
         return (
             Self.convolve(
                 hidden, dynamic: dynamic[0..., 0..., 0, 0..., 0...],
-                base: baseKernel[0], groupSize: groupSize),
+                taps: baseTaps(slot: 0, dtype: hidden.dtype, groups: groups),
+                groupSize: groupSize),
             dynamic[0..., 0..., 1, 0..., 0...]
         )
     }
 
     func finish(_ hidden: MLXArray, kernel: MLXArray) -> MLXArray {
-        Self.convolve(hidden, dynamic: kernel, base: baseKernel[1], groupSize: groupSize)
+        let groups = hidden.dim(-1) / groupSize
+        var dynamic = kernel
+        if kernel.ndim == 3 {
+            if let fused = fusedConvolve(hidden, projection: kernel, slot: 1) { return fused }
+            dynamic =
+                kernel.reshaped(hidden.dim(0), hidden.dim(1), 2, kernelSize, groups)[
+                    0..., 0..., 1, 0..., 0...]
+        }
+        return Self.convolve(
+            hidden, dynamic: dynamic,
+            taps: baseTaps(slot: 1, dtype: hidden.dtype, groups: groups), groupSize: groupSize)
     }
+}
+
+/// Holder for the dynamic conv's dtype-cast base taps (not a parameter).
+private final class DynamicConvTapCache {
+    var taps: [Int: (dtype: DType, taps: [MLXArray])] = [:]
+    var flat: [Int: (dtype: DType, taps: MLXArray)] = [:]
 }
 
 // MARK: - Attention
@@ -522,8 +591,7 @@ final class DFlash2CandidateSelector: Module {
         hidden: MLXArray, logits: MLXArray, anchor: MLXArray, temperature: Float
     ) -> DFlash2Proposal {
         let length = logits.dim(1)
-        let kth = logits.dim(-1) - topK
-        let candidates = argPartition(logits, kth: kth, axis: -1)[.ellipsis, kth...]
+        let candidates = topKIndices(logits, k: topK)
         let unary = takeAlong(logits, candidates, axis: -1)
         let projected = hiddenProjection(hidden)
         let successors = successorCodebook(candidates)
@@ -537,6 +605,15 @@ final class DFlash2CandidateSelector: Module {
             predecessors[0..., 0 ..< (length - 1), 0..., 0...]
             * projected[0..., 1..., .newAxis, 0...]
         let edges = matmul(gated, successors[0..., 1..., 0..., 0...].transposed(0, 1, 3, 2))
+
+        // The greedy path as one launch instead of a gather, add, argmax
+        // and gather per position.
+        if temperature == 0,
+            let tokens = dflash2GreedyWalk(
+                unary: unary, edges: edges, anchorEdges: anchorEdges, candidates: candidates)
+        {
+            return DFlash2Proposal(tokens: tokens, candidates: candidates, probabilities: nil)
+        }
 
         var path: [MLXArray] = []
         var distributions: [MLXArray] = []
@@ -646,11 +723,9 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         // Context K/V for the new rows, appended as placeholders.
         let contextKV = projectContext(targetHidden, position: contextPositionArray)
         let positions = (0 ..< rows).map { Int32(contextPosition + $0) }
-        var layerKV: [(MLXArray, MLXArray)] = []
         for (i, cache) in state.contextCaches.enumerated() {
-            layerKV.append(
-                cache.append(
-                    keys: contextKV[2 * i], values: contextKV[2 * i + 1], positions: positions))
+            cache.append(
+                keys: contextKV[2 * i], values: contextKV[2 * i + 1], positions: positions)
         }
         // Every layer's cache moves in lockstep; one mask serves them all.
         let mask = Self.visibilityMask(
@@ -659,6 +734,10 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
 
         // Embedding and head belong to the target, so they run outside the traces.
         var x = target.dflash2Embedding(block) * config.dflash.inputEmbeddingScale
+        for layer in layers {
+            layer.attentionConv.warmTaps(dtype: x.dtype, hiddenSize: config.hiddenSize)
+            layer.mlpConv.warmTaps(dtype: x.dtype, hiddenSize: config.hiddenSize)
+        }
         var attention: MLXArray? = nil
         var kernel: MLXArray? = nil
         for index in 0 ... layers.count {
@@ -670,17 +749,20 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
             x = outputs[0]
             guard index < layers.count else { break }
             kernel = outputs[1]
-            let (contextKeys, contextValues) = layerKV[index]
+            // The block's K/V go into the cache's slack rows; the kernel
+            // reads the context and the block as one view.
+            let (keys, values) = state.contextCaches[index].withBlock(
+                keys: outputs[3], values: outputs[4])
             attention = MLXFast.scaledDotProductAttention(
-                queries: outputs[2],
-                keys: concatenated([contextKeys, outputs[3]], axis: 2),
-                values: concatenated([contextValues, outputs[4]], axis: 2),
+                queries: outputs[2], keys: keys, values: values,
                 scale: layers[index].selfAttn.scale, mask: mask)
         }
 
         let hidden = x[0..., 1..., 0...]
-        var logits = target.dflash2Head?(hidden) ?? target.dflash2Embedding.asLinear(hidden)
-        logits = logits * config.dflash.outputMultiplier
+        var logits = headLogits(hidden, target: target)
+        if config.dflash.outputMultiplier != 1 {
+            logits = logits * config.dflash.outputMultiplier
+        }
         if let cap = config.dflash.finalLogitSoftcapping, cap > 0 {
             logits = tanh(logits / cap) * cap
         }
@@ -706,6 +788,99 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         let contextVisible = valid.expandedDimensions(axis: 0) & (distance .< Int32(window))
         return concatenated(
             [contextVisible, MLXArray.ones([width, width], dtype: .bool)], axis: 1)
+    }
+
+    // MARK: Head over a vocabulary prefix
+
+    /// The drafter's head runs over the first `draftVocabRows` vocabulary
+    /// rows. The drafter only needs its top-K candidates per position, and a
+    /// BPE vocabulary is merge-ordered, so the frequent tokens sit at the low
+    /// ids: on the bench fixtures no generated id exceeds 94K of 248K, and
+    /// the 98304-row prefix cut the round by 1.3-2.5 ms (the head is 40% of
+    /// the full 2.47 ms launch) with identical acceptance. The verify is
+    /// untouched: accepted tokens stay the target's argmax, and a token past
+    /// the prefix is simply undraftable. When the target commits two such
+    /// tokens within a few rounds (text in a script the prefix lacks) the
+    /// drafter widens to the full head for the next 64 rounds.
+    /// `DFLASH2_DRAFT_VOCAB=N` overrides; 0 disables.
+    private static let draftVocabRows: Int? = {
+        if let raw = ProcessInfo.processInfo.environment["DFLASH2_DRAFT_VOCAB"], let rows = Int(raw)
+        {
+            return rows > 0 ? rows : nil
+        }
+        return 98304
+    }()
+
+    private struct HeadPrefix {
+        var weight: MLXArray
+        var scales: MLXArray
+        var biases: MLXArray?
+        var groupSize: Int
+        var bits: Int
+        var mode: QuantizationMode
+        var rows: Int
+    }
+    private var headPrefix: HeadPrefix?
+    /// Rounds left on the full head after committed tokens past the prefix.
+    private var fullHeadRounds = 0
+    /// Decayed count of recent out-of-prefix commits: one isolated token (a
+    /// control token such as the end of a thinking block) does not widen,
+    /// two within a few rounds do.
+    private var recentMisses: Float = 0
+    private static let fullHeadRoundsAfterMiss = 64
+
+    public func observeCommitted(_ tokens: [Int]) {
+        guard let rows = Self.draftVocabRows else { return }
+        let misses = tokens.reduce(0) { $0 + ($1 >= rows ? 1 : 0) }
+        lock.withLock {
+            recentMisses = recentMisses * 0.75 + Float(misses)
+            if recentMisses >= 1.5 {
+                fullHeadRounds = Self.fullHeadRoundsAfterMiss
+            }
+        }
+    }
+
+    private func headLogits(_ hidden: MLXArray, target: any DFlash2TargetModel) -> MLXArray {
+        let widen = lock.withLock { () -> Bool in
+            guard fullHeadRounds > 0 else { return false }
+            fullHeadRounds -= 1
+            return true
+        }
+        if let rows = Self.draftVocabRows, !widen {
+            let prefix = lock.withLock { () -> HeadPrefix? in
+                if let existing = headPrefix, existing.rows == rows { return existing }
+                // Exact classes only: a subclass (a rotated head, say) applies
+                // more than the plain quantized matmul.
+                var source: (MLXArray, MLXArray, MLXArray?, Int, Int, QuantizationMode)? = nil
+                if let head = target.dflash2Head {
+                    if type(of: head) == QuantizedLinear.self, let q = head as? QuantizedLinear {
+                        source = (q.weight, q.scales, q.biases, q.groupSize, q.bits, q.mode)
+                    }
+                } else {
+                    let embedding = target.dflash2Embedding
+                    if type(of: embedding) == QuantizedEmbedding.self,
+                        let q = embedding as? QuantizedEmbedding
+                    {
+                        source = (q.weight, q.scales, q.biases, q.groupSize, q.bits, q.mode)
+                    }
+                }
+                guard let source, rows < source.0.dim(0) else { return nil }
+                let (w, s, b, groupSize, bits, mode) = source
+                let prefix = HeadPrefix(
+                    weight: w[0 ..< rows], scales: s[0 ..< rows],
+                    biases: b.map { $0[0 ..< rows] },
+                    groupSize: groupSize, bits: bits, mode: mode, rows: rows)
+                headPrefix = prefix
+                return prefix
+            }
+            if let prefix {
+                return quantizedMM(
+                    hidden, prefix.weight, scales: prefix.scales, biases: prefix.biases,
+                    transpose: true, groupSize: prefix.groupSize, bits: prefix.bits,
+                    mode: prefix.mode)
+            }
+        }
+        return target.dflash2Head?(hidden) ?? target.dflash2Embedding.asLinear(hidden)
     }
 
     // MARK: Compiled segments
@@ -751,9 +926,19 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         let key = SegmentKey(index: index, width: width)
         return lock.withLock {
             if let existing = segmentTraces[key] { return existing }
-            let trace = CompiledTrace<DFlash2DraftModel> { model, args in
-                model.segmentBody(at: index, args)
-            }
+            let trace = CompiledTrace<DFlash2DraftModel>(
+                state: { model in
+                    var modules: [Module] = []
+                    if index > 0 { modules.append(model.layers[index - 1]) }
+                    if index < model.layers.count {
+                        modules.append(model.layers[index])
+                        modules.append(model.rope)
+                    } else {
+                        modules.append(model.norm)
+                    }
+                    return modules
+                },
+                body: { model, args in model.segmentBody(at: index, args) })
             segmentTraces[key] = trace
             return trace
         }
@@ -776,7 +961,11 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         }
         let trace = lock.withLock {
             if let existing = contextTraces[rows] { return existing }
-            let trace = CompiledTrace<DFlash2DraftModel> { model, args in model.contextBody(args) }
+            let trace = CompiledTrace<DFlash2DraftModel>(
+                state: { model in
+                    [model.fc, model.hiddenNorm, model.rope] + model.layers.map { $0.selfAttn }
+                },
+                body: { model, args in model.contextBody(args) })
             contextTraces[rows] = trace
             return trace
         }
