@@ -989,8 +989,9 @@ final class Qwen35DecoderLayer: Module {
                 positionOffset: positionOffset)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let (h, normed) = rmsNormResidual(
+            x, r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps)
+        return h + (mlp as! UnaryLayer)(normed)
     }
 
     // MARK: - Compiled decode blocks
@@ -998,9 +999,9 @@ final class Qwen35DecoderLayer: Module {
     // Every body stays inside this layer, so each trace's default state (the
     // layer's own weights) is complete.
     private let compiledLinearLayer = CompiledTrace<Qwen35DecoderLayer> { layer, arguments in
-        let (out, newConvState, newRecState) = layer.linearLayerBody(
+        let result = layer.linearLayerBody(
             x: arguments[0], convState: arguments[1], recState: arguments[2])
-        return [out, newConvState, newRecState]
+        return [result.out, result.convState, result.recState]
     }
 
     private let compiledAttentionPre = CompiledTrace<Qwen35DecoderLayer> { layer, arguments in
@@ -1012,7 +1013,8 @@ final class Qwen35DecoderLayer: Module {
     private let compiledAttentionPost = CompiledTrace<Qwen35DecoderLayer> { layer, arguments in
         [
             layer.attentionPostBody(
-                x: arguments[0], attention: arguments[1], gate: arguments[2])
+                x: arguments[0], attention: arguments[1], gate: arguments[2]
+            ).out
         ]
     }
 
@@ -1061,33 +1063,51 @@ final class Qwen35DecoderLayer: Module {
 
     // MARK: - Layer bodies
 
-    func linearLayerBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
-        MLXArray, MLXArray, MLXArray
+    /// The residual sum, plus the next layer's normed input when `next` is
+    /// given: one launch for the add and the norm that follows it.
+    private func residualOut(_ h: MLXArray, _ branch: MLXArray, next: RMSNorm?) -> (
+        MLXArray, MLXArray?
     ) {
+        guard let next else { return (h + branch, nil) }
+        let (out, normed) = rmsNormResidual(h, branch, weight: next.weight, eps: next.eps)
+        return (out, normed)
+    }
+
+    /// `normedX` is `inputLayerNorm(x)` when the previous layer already
+    /// produced it; `nextNorm` asks for the next layer's normed input.
+    func linearLayerBody(
+        x: MLXArray, normedX: MLXArray? = nil, convState: MLXArray, recState: MLXArray,
+        nextNorm: RMSNorm? = nil
+    ) -> (out: MLXArray, nextNormed: MLXArray?, convState: MLXArray, recState: MLXArray) {
         let (r, newConvState, newRecState, _) = linearAttn!.forward(
-            inputLayerNorm(x), convState: convState, recState: recState, mask: nil)
-        let h = x + r
-        return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState)
+            normedX ?? inputLayerNorm(x), convState: convState, recState: recState, mask: nil)
+        let (h, normed) = rmsNormResidual(
+            x, r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps)
+        let (out, nextNormed) = residualOut(h, mlpForward(normed), next: nextNorm)
+        return (out, nextNormed, newConvState, newRecState)
     }
 
     /// `linearLayerBody` for a DFlash2 verify pass; the recurrent state is
     /// returned as a capture instead of a new state.
-    func linearLayerVerifyBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
-        out: MLXArray, convState: MLXArray, capture: GatedDeltaCapture
-    ) {
+    func linearLayerVerifyBody(
+        x: MLXArray, normedX: MLXArray? = nil, convState: MLXArray, recState: MLXArray,
+        nextNorm: RMSNorm? = nil
+    ) -> (out: MLXArray, nextNormed: MLXArray?, convState: MLXArray, capture: GatedDeltaCapture) {
         let (r, newConvState, capture) = linearAttn!.verifyForward(
-            inputLayerNorm(x), convState: convState, recState: recState)
-        let h = x + r
-        return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, capture)
+            normedX ?? inputLayerNorm(x), convState: convState, recState: recState)
+        let (h, normed) = rmsNormResidual(
+            x, r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps)
+        let (out, nextNormed) = residualOut(h, mlpForward(normed), next: nextNorm)
+        return (out, nextNormed, newConvState, capture)
     }
 
     /// Rope lives inside the trace: its offset rides in as a `[1]` array, so
     /// the trace neither bakes it in nor reruns the projections outside.
-    func attentionPreBody(x: MLXArray, ropeOffset: MLXArray) -> (
+    func attentionPreBody(x: MLXArray, normedX: MLXArray? = nil, ropeOffset: MLXArray) -> (
         MLXArray, MLXArray, MLXArray, MLXArray
     ) {
         let attn = selfAttn!
-        let input = inputLayerNorm(x)
+        let input = normedX ?? inputLayerNorm(x)
         if let fused = attn.projectNormRope(input, offset: ropeOffset) { return fused }
         let (queries, gate, keys, values) = attn.projectPreRope(input)
         return (
@@ -1099,10 +1119,13 @@ final class Qwen35DecoderLayer: Module {
     }
 
     /// `x` is the layer input — the residual branch around the attention block.
-    func attentionPostBody(x: MLXArray, attention: MLXArray, gate: MLXArray) -> MLXArray {
+    func attentionPostBody(
+        x: MLXArray, attention: MLXArray, gate: MLXArray, nextNorm: RMSNorm? = nil
+    ) -> (out: MLXArray, nextNormed: MLXArray?) {
         let r = selfAttn!.mergeHeadsAndProject(attention: attention, gate: gate)
-        let h = x + r
-        return h + mlpForward(postAttentionLayerNorm(h))
+        let (h, normed) = rmsNormResidual(
+            x, r, weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps)
+        return residualOut(h, mlpForward(normed), next: nextNorm)
     }
 
     private func mlpForward(_ x: MLXArray) -> MLXArray {
@@ -1237,6 +1260,16 @@ public class Qwen35TextModelInner: Module {
 
     var compiledDecodeSegmentCount: Int { compiledSegments.compiledCount }
 
+    /// The input norm of the layer that follows linear layer `i` of a segment
+    /// (`-1`: the layer after the segment's opening attention tail); nil when
+    /// the segment ends there.
+    private func nextInputNorm(in segment: CompiledDecodeSegment, afterLinear i: Int) -> RMSNorm? {
+        if i + 1 < segment.linearLayers.count {
+            return layers[segment.linearLayers[i + 1]].inputLayerNorm
+        }
+        return segment.attentionPreLayer.map { layers[$0].inputLayerNorm }
+    }
+
     /// Flat argument/result lists because `compile` takes `[MLXArray]`.
     /// In: `[x]` (token ids for segment 0), then `[attention, gate]` when
     /// opening with a full-attention tail, then `[convState, recState]` per
@@ -1245,25 +1278,31 @@ public class Qwen35TextModelInner: Module {
     private func segmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
         let segment = decodeSegments[index]
         var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
+        // Each layer's residual add also produces the next layer's normed
+        // input (one launch), carried here across the segment's layers.
+        var normedInput: MLXArray? = nil
 
         if let post = segment.attentionPostLayer {
-            hiddenStates = layers[post].attentionPostBody(
-                x: hiddenStates, attention: args[1], gate: args[2])
+            (hiddenStates, normedInput) = layers[post].attentionPostBody(
+                x: hiddenStates, attention: args[1], gate: args[2],
+                nextNorm: nextInputNorm(in: segment, afterLinear: -1))
         }
 
         var states: [MLXArray] = []
         for (i, layerIndex) in segment.linearLayers.enumerated() {
             let slot = segment.stateInputOffset + 2 * i
-            let (out, newConvState, newRecState) = layers[layerIndex].linearLayerBody(
-                x: hiddenStates, convState: args[slot], recState: args[slot + 1])
-            hiddenStates = out
-            states.append(newConvState)
-            states.append(newRecState)
+            let result = layers[layerIndex].linearLayerBody(
+                x: hiddenStates, normedX: normedInput, convState: args[slot],
+                recState: args[slot + 1], nextNorm: nextInputNorm(in: segment, afterLinear: i))
+            hiddenStates = result.out
+            normedInput = result.nextNormed
+            states.append(result.convState)
+            states.append(result.recState)
         }
 
         if let pre = segment.attentionPreLayer {
             let (queries, gate, keys, values) = layers[pre].attentionPreBody(
-                x: hiddenStates, ropeOffset: args.last!)
+                x: hiddenStates, normedX: normedInput, ropeOffset: args.last!)
             // The next segment needs the attention layer's input for its residual.
             return [hiddenStates] + states + [queries, gate, keys, values]
         }
@@ -1363,29 +1402,33 @@ public class Qwen35TextModelInner: Module {
     ) -> [MLXArray] {
         let segment = decodeSegments[index]
         var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
+        var normedInput: MLXArray? = nil
         var captured: [MLXArray] = []
 
         if let post = segment.attentionPostLayer {
-            hiddenStates = layers[post].attentionPostBody(
-                x: hiddenStates, attention: args[1], gate: args[2])
+            (hiddenStates, normedInput) = layers[post].attentionPostBody(
+                x: hiddenStates, attention: args[1], gate: args[2],
+                nextNorm: nextInputNorm(in: segment, afterLinear: -1))
             if captureLayers.contains(post) { captured.append(hiddenStates) }
         }
 
         var states: [MLXArray] = []
         for (i, layerIndex) in segment.linearLayers.enumerated() {
             let slot = segment.stateInputOffset + 2 * i
-            let (out, newConvState, capture) = layers[layerIndex].linearLayerVerifyBody(
-                x: hiddenStates, convState: args[slot], recState: args[slot + 1])
-            hiddenStates = out
-            states.append(newConvState)
-            states.append(contentsOf: capture.arrays)
+            let result = layers[layerIndex].linearLayerVerifyBody(
+                x: hiddenStates, normedX: normedInput, convState: args[slot],
+                recState: args[slot + 1], nextNorm: nextInputNorm(in: segment, afterLinear: i))
+            hiddenStates = result.out
+            normedInput = result.nextNormed
+            states.append(result.convState)
+            states.append(contentsOf: result.capture.arrays)
             if captureLayers.contains(layerIndex) { captured.append(hiddenStates) }
         }
 
         var outputs = [hiddenStates] + states + captured
         if let pre = segment.attentionPreLayer {
             let (queries, gate, keys, values) = layers[pre].attentionPreBody(
-                x: hiddenStates, ropeOffset: args.last!)
+                x: hiddenStates, normedX: normedInput, ropeOffset: args.last!)
             outputs += [queries, gate, keys, values]
         }
         return outputs

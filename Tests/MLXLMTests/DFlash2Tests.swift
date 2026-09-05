@@ -254,6 +254,27 @@ func testDFlash2DynamicConvMatchesNaive() throws {
 // MARK: - Selector
 
 @Test
+func testRMSNormResidualIsBitwiseExact() throws {
+    // Both MLX geometries (looped above 4096, single pass below), bf16 and
+    // f16: the fused kernel must reproduce Add then RMSNorm bit for bit.
+    for (seed, rows, axis, dtype) in [
+        (1, 8, 5120, DType.bfloat16), (2, 1, 5120, .bfloat16), (3, 5, 2048, .float16),
+        (4, 3, 100, .bfloat16), (5, 8, 5120, .float32),
+    ] as [(UInt64, Int, Int, DType)] {
+        MLXRandom.seed(seed)
+        let x = (MLXRandom.normal([1, rows, axis]) * 3).asType(dtype)
+        let r = (MLXRandom.normal([1, rows, axis]) * 0.5).asType(dtype)
+        let weight = (MLXRandom.normal([axis]) + 1).asType(dtype)
+        let eps: Float = 1e-6
+        let h = x + r
+        let reference = MLXFast.rmsNorm(h, weight: weight, eps: eps)
+        let fused = rmsNormResidual(x, r, weight: weight, eps: eps)
+        #expect((fused.h .== h).all().item(Bool.self), "sum axis \(axis) \(dtype)")
+        #expect((fused.out .== reference).all().item(Bool.self), "norm axis \(axis) \(dtype)")
+    }
+}
+
+@Test
 func testDFlash2SelectorGreedyPrefersCoherentPath() throws {
     // vocab 12, topK 3, rank 4, hidden 8. Position 0's top-1 candidate is a
     // decoy; the selector must switch to the candidate the anchor points at.

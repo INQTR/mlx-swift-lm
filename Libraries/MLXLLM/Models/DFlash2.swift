@@ -398,18 +398,29 @@ final class DFlash2DecoderLayer: Module {
 
     /// Input norm, conv prepare and the block projections.
     func preAttention(
-        x: MLXArray, rope: RoPELayer, position: MLXArray
+        x: MLXArray, normedX: MLXArray? = nil, rope: RoPELayer, position: MLXArray
     ) -> (kernel: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray) {
-        let (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
+        let (h, kernel) = attentionConv.prepare(normedX ?? inputLayerNorm(x))
         let (queries, keys, values) = selfAttn.projectBlock(h, rope: rope, position: position)
         return (kernel, queries, keys, values)
     }
 
     /// Output projection, conv finish, both residual adds and the MLP.
-    func postAttention(x: MLXArray, attention: MLXArray, kernel: MLXArray) -> MLXArray {
-        let h = x + attentionConv.finish(selfAttn.project(attention), kernel: kernel)
-        let (m, mlpKernel) = mlpConv.prepare(postAttentionLayerNorm(h))
-        return h + mlpConv.finish(mlp(m), kernel: mlpKernel)
+    /// Both residual adds run inside the norm launches that follow them
+    /// (`rmsNormResidual`); `nextNorm` asks for the next layer's normed
+    /// input, or the final norm's output, from the same launch.
+    func postAttention(
+        x: MLXArray, attention: MLXArray, kernel: MLXArray, nextNorm: RMSNorm? = nil
+    ) -> (out: MLXArray, nextNormed: MLXArray?) {
+        let (h, normed) = rmsNormResidual(
+            x, attentionConv.finish(selfAttn.project(attention), kernel: kernel),
+            weight: postAttentionLayerNorm.weight, eps: postAttentionLayerNorm.eps)
+        let (m, mlpKernel) = mlpConv.prepare(normed)
+        let branch = mlpConv.finish(mlp(m), kernel: mlpKernel)
+        guard let nextNorm else { return (h + branch, nil) }
+        let (out, nextNormed) = rmsNormResidual(
+            h, branch, weight: nextNorm.weight, eps: nextNorm.eps)
+        return (out, nextNormed)
     }
 }
 
@@ -723,13 +734,16 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     /// `[x, kernel, queries, keys, values]`, or `[normed]` for the last.
     private func segmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
         var x = args[0]
+        var normed: MLXArray? = nil
         if index > 0 {
-            x = layers[index - 1].postAttention(x: x, attention: args[1], kernel: args[2])
+            (x, normed) = layers[index - 1].postAttention(
+                x: x, attention: args[1], kernel: args[2],
+                nextNorm: index < layers.count ? layers[index].inputLayerNorm : norm)
         }
-        guard index < layers.count else { return [norm(x)] }
+        guard index < layers.count else { return [normed ?? norm(x)] }
         let position = args[index == 0 ? 1 : 3]
         let (kernel, queries, keys, values) = layers[index].preAttention(
-            x: x, rope: rope, position: position)
+            x: x, normedX: normed, rope: rope, position: position)
         return [x, kernel, queries, keys, values]
     }
 
