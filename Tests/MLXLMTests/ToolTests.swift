@@ -450,6 +450,96 @@ struct ToolTests {
         #expect(toolCall.function.arguments["location"] == .string("Osaka"))
     }
 
+    /// Drives the legacy `processChunk` API and returns everything it hands
+    /// back as visible text, end-of-sequence residue included.
+    private func legacyText(_ processor: ToolCallProcessor, chunks: [String]) -> String {
+        var emitted = ""
+        for chunk in chunks {
+            if let text = processor.processChunk(chunk) {
+                emitted += text
+            }
+        }
+        if let text = processor.processEOS(returnBufferedText: true) {
+            emitted += text
+        }
+        return emitted
+    }
+
+    /// Drives the ordered-output API and returns its visible text.
+    private func orderedText(_ processor: ToolCallProcessor, chunks: [String]) -> String {
+        var outputs: [ToolCallProcessor.Output] = []
+        for chunk in chunks {
+            outputs += processor.processChunkOutputs(chunk)
+        }
+        outputs += processor.processEOSOutputs()
+        return outputs.reduce(into: "") { text, output in
+            if case .response(let piece) = output { text += piece }
+        }
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Text Before A Non-Tag Angle Bracket Survives")
+    func testJSONFormatProcessorTextBeforeNonTagAngleBracketSurvives() {
+        // Detokenized chunks arrive one token at a time; a token like " `<" ends
+        // in a possible start tag, and the next token proves it was prose.
+        let chunks = [" injected as a", " `<", "memory", ">`", " block"]
+
+        let legacy = ToolCallProcessor(format: .json)
+        #expect(legacyText(legacy, chunks: chunks) == " injected as a `<memory>` block")
+        #expect(legacy.toolCalls.isEmpty)
+
+        let ordered = ToolCallProcessor(format: .json)
+        #expect(orderedText(ordered, chunks: chunks) == " injected as a `<memory>` block")
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Space Before A Comparison Operator Survives")
+    func testJSONFormatProcessorSpaceBeforeComparisonOperatorSurvives() {
+        let chunks = ["if a", " <", " b", " {"]
+
+        let legacy = ToolCallProcessor(format: .json)
+        #expect(legacyText(legacy, chunks: chunks) == "if a < b {")
+
+        let ordered = ToolCallProcessor(format: .json)
+        #expect(orderedText(ordered, chunks: chunks) == "if a < b {")
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Text Before A Split Start Tag Is Emitted Once")
+    func testJSONFormatProcessorTextBeforeSplitStartTagEmittedOnce() throws {
+        let chunks = [
+            "Let me check.\n<tool",
+            "_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Osaka\"}}",
+            "</tool_call>",
+        ]
+
+        let legacy = ToolCallProcessor(format: .json)
+        #expect(legacyText(legacy, chunks: chunks) == "Let me check.\n")
+        #expect(legacy.toolCalls.count == 1)
+        let toolCall = try #require(legacy.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Osaka"))
+
+        let ordered = ToolCallProcessor(format: .json)
+        #expect(orderedText(ordered, chunks: chunks) == "Let me check.\n")
+    }
+
+    @Test(
+        "Test JSON Format via ToolCallProcessor - Text Before A Multi-Chunk Tool Call Is Emitted Once"
+    )
+    func testJSONFormatProcessorTextBeforeMultiChunkToolCallEmittedOnce() throws {
+        let chunks = [
+            "Note: <tool_call>{\"name\":\"get_weather\",",
+            "\"arguments\":{\"location\":\"Osaka\"}}</tool_call>",
+        ]
+
+        let legacy = ToolCallProcessor(format: .json)
+        #expect(legacyText(legacy, chunks: chunks) == "Note: ")
+        #expect(legacy.toolCalls.count == 1)
+        let toolCall = try #require(legacy.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+
+        let ordered = ToolCallProcessor(format: .json)
+        #expect(orderedText(ordered, chunks: chunks) == "Note: ")
+    }
+
     @Test("Test JSON Format via ToolCallProcessor - Incomplete Bare Tool Rejects At EOS")
     func testJSONFormatProcessorIncompleteBareToolRejectsAtEOS() throws {
         let processor = ToolCallProcessor(format: .json)
