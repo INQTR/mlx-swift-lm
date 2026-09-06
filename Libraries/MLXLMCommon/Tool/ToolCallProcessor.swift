@@ -595,7 +595,9 @@ public class ToolCallProcessor {
                 } else {
                     recordResponse(leadingToken ?? "")
                     leadingTokenWasRecorded = true
-                    return nil
+                    // Keep buffering the possible tag, but hand back the text
+                    // that preceded it: this call is the only one that knows it.
+                    return leadingToken?.isEmpty ?? true ? nil : leadingToken
                 }
             } else {
                 // Otherwise, return the collected text and reset the state.
@@ -619,7 +621,7 @@ public class ToolCallProcessor {
 
         case .collectingToolCall:
             guard let endTag = parser.endTag else {
-                return nil
+                return leadingToken?.isEmpty ?? true ? nil : leadingToken
             }
 
             if toolCallBuffer.contains(endTag) {
@@ -672,7 +674,9 @@ public class ToolCallProcessor {
                 return combine(leadingToken, trailingToken)
             }
 
-            return nil
+            // The call stays buffered until its end tag; the text that
+            // preceded the start tag in this chunk does not.
+            return leadingToken?.isEmpty ?? true ? nil : leadingToken
 
         case .collectingJSONToolCall:
             return processCollectingJSONToolCall(
