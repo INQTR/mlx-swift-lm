@@ -672,7 +672,7 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
 
     /// The dtype the drafter computes in: its checkpoint's, which quantization
     /// keeps on the norms.
-    var computeDType: DType { hiddenNorm.weight.dtype }
+    private var computeDType: DType { hiddenNorm.weight.dtype }
 
     public init(_ config: DFlash2Configuration) {
         self.config = config
@@ -724,12 +724,13 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         let contextPositionArray = MLXArray([Int32(contextPosition)])
         let blockPosition = contextPositionArray + validRows.asType(.int32).reshaped([1])
 
-        // The target hands over its embedding and captured hidden states in its
-        // own dtype (a float16 ParoQuant target beside this bfloat16 drafter);
-        // the fused residual norm, dynamic conv and greedy walk take one dtype
-        // throughout, so the drafter casts at its two entries and its head.
-        // No-ops when the pairing already agrees.
+        // The fused residual norm, dynamic conv and greedy walk take one dtype
+        // throughout, so the drafter computes in its own and casts what the
+        // target hands over (float16 from a ParoQuant target beside this
+        // bfloat16 drafter) at its entries; the target's head reads the
+        // target's dtype.
         let dtype = computeDType
+        let targetDType = targetHidden.dtype
 
         // Context K/V for the new rows, appended as placeholders.
         let contextKV = projectContext(
@@ -745,9 +746,10 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
             blockPosition: blockPosition, width: width, window: config.slidingWindow)
 
         // Embedding and head belong to the target, so they run outside the traces.
-        let embedded = target.dflash2Embedding(block)
-        let targetDType = embedded.dtype
-        var x = embedded.asType(dtype) * config.dflash.inputEmbeddingScale
+        var x = target.dflash2Embedding(block).asType(dtype)
+        if config.dflash.inputEmbeddingScale != 1 {
+            x = x * config.dflash.inputEmbeddingScale
+        }
         for layer in layers {
             layer.attentionConv.warmTaps(dtype: x.dtype, hiddenSize: config.hiddenSize)
             layer.mlpConv.warmTaps(dtype: x.dtype, hiddenSize: config.hiddenSize)
@@ -773,8 +775,6 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         }
 
         let hidden = x[0..., 1..., 0...]
-        // The head is the target's, so it reads the target's dtype; the
-        // selector scores in the drafter's.
         var logits = headLogits(hidden.asType(targetDType), target: target).asType(dtype)
         if config.dflash.outputMultiplier != 1 {
             logits = logits * config.dflash.outputMultiplier

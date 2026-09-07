@@ -815,75 +815,29 @@ func testSpeculativeSamplingProbabilitiesMatchTopPSampler() {
     }
 }
 
-// MARK: - Target dtype
-
-@Test
-func testDFlash2DrafterComputesInItsOwnDTypeBesideAFloat16Target() throws {
-    // A ParoQuant target hands over float16 embeddings and hidden states while
-    // the drafter's checkpoint is bfloat16. The fused residual norm, dynamic
-    // conv and greedy walk take one dtype throughout, so the drafter casts at
-    // its entries and its head instead of letting the mixed matmuls promote to
-    // float32 — and the compiled walk still matches the eager one.
-    let config = tinyConfig(window: 24, vocab: MockTarget.vocab)
-    MLXRandom.seed(5)
-    let compiled = DFlash2DraftModel(config)
-    let eager = DFlash2DraftModel(config)
-    eager.compiledTracesEnabled = false
-    let bf16 = compiled.parameters().mapValues { $0.asType(.bfloat16) }
-    try compiled.update(parameters: bf16, verify: [])
-    try eager.update(parameters: bf16, verify: [])
-    #expect(compiled.computeDType == .bfloat16)
-    let target = MockTarget()
-    try target.embedding.update(
-        parameters: target.embedding.parameters().mapValues { $0.asType(.float16) }, verify: [])
-    #expect(target.dflash2Embedding.weight.dtype == .float16)
-
-    var stateA = compiled.makeState()
-    var stateB = eager.makeState()
-    let concatDim = config.dflash.targetLayerIds.count * config.hiddenSize
-    let rounds: [(rows: Int, valid: Int, width: Int)] = [(20, 20, 5), (3, 2, 5), (5, 4, 3)]
-    var position = 0
-    var anchor: Int32 = 7
-    for (round, spec) in rounds.enumerated() {
-        let targetHidden = MLXRandom.normal([1, spec.rows, concatDim]).asType(.float16)
-        let block = MLXArray(
-            [anchor] + Array(repeating: Int32(config.dflash.maskTokenId), count: spec.width - 1)
-        ).expandedDimensions(axis: 0)
-        let validRows = MLXArray(Int32(spec.valid))
-        let a = compiled.propose(
-            block: block, targetHidden: targetHidden, contextPosition: position,
-            validRows: validRows, temperature: 0, target: target, state: &stateA)
-        let b = eager.propose(
-            block: block, targetHidden: targetHidden, contextPosition: position,
-            validRows: validRows, temperature: 0, target: target, state: &stateB)
-        eval(a.tokens, b.tokens, a.candidates, b.candidates)
-        #expect(a.tokens.shape == [1, spec.width - 1], "round \(round)")
-        #expect(a.tokens.asArray(Int32.self) == b.tokens.asArray(Int32.self), "round \(round)")
-        #expect(
-            a.candidates.asArray(Int32.self) == b.candidates.asArray(Int32.self),
-            "round \(round)")
-        for state in [stateA, stateB] {
-            // The context rows live in the drafter's dtype, not the target's.
-            #expect(state.contextCaches[0].keys?.dtype == .bfloat16, "round \(round)")
-            state.contextCaches[0].resolve(newest: spec.rows, valid: spec.valid)
-        }
-        position += spec.valid
-        anchor = a.tokens[0, 0].item(Int32.self)
-    }
-    #expect(compiled.compiledTraceCount >= 4)
-}
-
 // MARK: - Compiled drafter
 
-@Test
-func testDFlash2CompiledProposalMatchesEager() throws {
+/// The compiled walk matches the eager one for a float32 pairing and for the
+/// shipped one: a bfloat16 drafter beside a float16 ParoQuant target, whose
+/// embedding and hidden states the drafter casts at its entries so the fused
+/// residual norm, dynamic conv and greedy walk see one dtype.
+@Test(arguments: [
+    (drafter: DType.float32, target: DType.float32),
+    (drafter: DType.bfloat16, target: DType.float16),
+])
+func testDFlash2CompiledProposalMatchesEager(pairing: (drafter: DType, target: DType)) throws {
     let config = tinyConfig(window: 24, vocab: MockTarget.vocab)
     MLXRandom.seed(11)
     let compiled = DFlash2DraftModel(config)
     let eager = DFlash2DraftModel(config)
     eager.compiledTracesEnabled = false
-    try eager.update(parameters: compiled.parameters(), verify: [])
+    let parameters = compiled.parameters().mapValues { $0.asType(pairing.drafter) }
+    try compiled.update(parameters: parameters, verify: [])
+    try eager.update(parameters: parameters, verify: [])
     let target = MockTarget()
+    try target.embedding.update(
+        parameters: target.embedding.parameters().mapValues { $0.asType(pairing.target) },
+        verify: [])
 
     var stateA = compiled.makeState()
     var stateB = eager.makeState()
@@ -897,11 +851,13 @@ func testDFlash2CompiledProposalMatchesEager() throws {
     for (round, spec) in rounds.enumerated() {
         if round == 1 || round == 4 {
             // Trace inputs must include every weight read by each segment.
-            let updated = DFlash2DraftModel(config)
-            try compiled.update(parameters: updated.parameters(), verify: [])
-            try eager.update(parameters: updated.parameters(), verify: [])
+            let updated = DFlash2DraftModel(config).parameters().mapValues {
+                $0.asType(pairing.drafter)
+            }
+            try compiled.update(parameters: updated, verify: [])
+            try eager.update(parameters: updated, verify: [])
         }
-        let targetHidden = MLXRandom.normal([1, spec.rows, concatDim])
+        let targetHidden = MLXRandom.normal([1, spec.rows, concatDim]).asType(pairing.target)
         let block = MLXArray(
             [anchor] + Array(repeating: Int32(config.dflash.maskTokenId), count: spec.width - 1)
         ).expandedDimensions(axis: 0)
@@ -918,6 +874,8 @@ func testDFlash2CompiledProposalMatchesEager() throws {
             a.candidates.asArray(Int32.self) == b.candidates.asArray(Int32.self),
             "round \(round)")
         for state in [stateA, stateB] {
+            // The context rows live in the drafter's dtype, not the target's.
+            #expect(state.contextCaches[0].keys?.dtype == pairing.drafter, "round \(round)")
             state.contextCaches[0].resolve(newest: spec.rows, valid: spec.valid)
         }
         position += spec.valid
