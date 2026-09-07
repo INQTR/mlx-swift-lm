@@ -553,6 +553,7 @@ public class ToolCallProcessor {
         toolCallBuffer += chunk
         var leadingToken: String?
         var leadingTokenWasRecorded = false
+        var enteredCollectingThisChunk = false
 
         switch state {
         case .normal:
@@ -591,6 +592,7 @@ public class ToolCallProcessor {
                     state = .collectingToolCall
                     recordResponse(leadingToken ?? "")
                     leadingTokenWasRecorded = true
+                    enteredCollectingThisChunk = true
                     fallthrough
                 } else {
                     recordResponse(leadingToken ?? "")
@@ -624,7 +626,18 @@ public class ToolCallProcessor {
                 return leadingToken?.isEmpty ?? true ? nil : leadingToken
             }
 
-            if toolCallBuffer.contains(endTag) {
+            // Only the text this chunk appended can complete the end tag: an
+            // earlier occurrence would have left this state when it arrived.
+            // Scan the chunk plus the tag's overlap with what preceded it,
+            // not the whole buffered call — that is quadratic in the call's
+            // length, seconds for a call of ten thousand tokens. The
+            // fall-through from a partial start tag scans the whole buffer,
+            // which then holds at most the start tag and this chunk.
+            let endTagArrived =
+                enteredCollectingThisChunk
+                ? toolCallBuffer.contains(endTag)
+                : toolCallBuffer.suffix(chunk.count + endTag.count - 1).contains(endTag)
+            if endTagArrived {
                 // Separate the trailing token.
                 let trailingToken = separateToken(
                     from: &toolCallBuffer, separator: endTag, returnLeading: false)
